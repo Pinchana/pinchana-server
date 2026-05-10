@@ -15,12 +15,12 @@ RUN apt-get update && apt-get install -y \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Copy pinchana-core (local path dependency) first
-COPY pinchana-core/pyproject.toml pinchana-core/uv.lock ../pinchana-core/
+COPY pinchana-core/pyproject.toml pinchana-core/uv.lock pinchana-core/README.md ../pinchana-core/
 RUN mkdir -p ../pinchana-core/src
 COPY pinchana-core/src ../pinchana-core/src
 
 # Copy server package files
-COPY pinchana-server/pyproject.toml pinchana-server/uv.lock ./
+COPY pinchana-server/pyproject.toml pinchana-server/uv.lock pinchana-server/README.md ./
 RUN uv sync --frozen --no-install-project
 
 COPY pinchana-server/src ./src

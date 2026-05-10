@@ -10,7 +10,7 @@ import httpx
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
-from pinchana_core.docker_manager import ModuleContainerManager
+from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +31,12 @@ for mod_name in SCRAPER_MODULES:
         logger.debug("In-process plugin not available: %s (%s)", mod_name, e)
 
 # ---------------------------------------------------------------------------
-# 2. Container module manager (optional)
+# 2. Container registry (always available — reads module endpoints from config)
+# ---------------------------------------------------------------------------
+container_registry = ContainerRegistry()
+
+# ---------------------------------------------------------------------------
+# 3. Container module manager (optional — for runtime build/start/stop)
 # ---------------------------------------------------------------------------
 container_manager: ModuleContainerManager | None = None
 if os.getenv("CONTAINER_MODE", "false").lower() in ("1", "true", "yes"):
@@ -44,7 +49,7 @@ if os.getenv("CONTAINER_MODE", "false").lower() in ("1", "true", "yes"):
         logger.warning("Container manager failed to initialize: %s", e)
 
 # ---------------------------------------------------------------------------
-# 3. FastAPI app
+# 4. FastAPI app
 # ---------------------------------------------------------------------------
 storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
@@ -73,20 +78,20 @@ def _resolve_module(url: str):
                 return "in_process", name, plugin
 
     # 2. Container module match
-    if container_manager:
-        for name, module in container_manager.modules.items():
-            for pattern in module.route_patterns:
-                if pattern.lower() in url_lower:
-                    return "container", name, module
+    for name, module in container_registry.modules.items():
+        for pattern in module.route_patterns:
+            if pattern.lower() in url_lower:
+                return "container", name, module
 
     return None, None, None
 
 
 async def _forward_to_container(module_name: str, request: ScrapeRequest) -> ScrapeResponse:
-    if not container_manager or module_name not in container_manager.running:
-        raise HTTPException(status_code=503, detail=f"Container module {module_name} is not running")
+    module = container_registry.modules.get(module_name)
+    if not module:
+        raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
 
-    endpoint = container_manager.running[module_name]["endpoint"]
+    endpoint = module.endpoint
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
         resp.raise_for_status()
@@ -107,7 +112,7 @@ async def process_scrape_request(request: ScrapeRequest):
             status_code=400,
             detail="No module handles this URL. "
                    f"Plugins: {[p.route_patterns for p in registry._plugins.values()]}  "
-                   f"Containers: {list(container_manager.modules.keys()) if container_manager else []}"
+                   f"Containers: {[{n: m.route_patterns} for n, m in container_registry.modules.items()]}"
         )
 
     if mode == "in_process":
@@ -157,15 +162,14 @@ async def health_check():
             results[name] = {"mode": "in_process", "status": "unhealthy", "detail": str(e)}
             all_healthy = False
 
-    # Container modules
-    if container_manager:
-        for name, info in container_manager.list_running().items():
-            health = container_manager.health(name)
-            if health["status"] == "running":
-                results[name] = {"mode": "container", "status": "healthy", "detail": info}
-            else:
-                results[name] = {"mode": "container", "status": "unhealthy", "detail": health}
-                all_healthy = False
+    # Container modules (HTTP health check via registry endpoint)
+    for name, module in container_registry.modules.items():
+        health = await container_registry.health(name)
+        if health["status"] == "healthy":
+            results[name] = {"mode": "container", "status": "healthy", "detail": health["detail"]}
+        else:
+            results[name] = {"mode": "container", "status": "unhealthy", "detail": health}
+            all_healthy = False
 
     if not all_healthy:
         raise HTTPException(status_code=503, detail=results)
@@ -200,17 +204,25 @@ async def admin_list_modules():
         "in_process": {name: {"patterns": p.route_patterns} for name, p in registry.items()},
         "containers": {},
     }
-    if container_manager:
-        result["containers"] = {
-            name: {
-                "config": {
-                    "source_type": m.source_type,
-                    "source_url": m.source_url,
-                    "port": m.port,
-                    "image_tag": m.image_tag,
-                },
-                "running": name in container_manager.running,
-            }
-            for name, m in container_manager.modules.items()
+
+    # Show all configured container modules from registry
+    for name, m in container_registry.modules.items():
+        result["containers"][name] = {
+            "config": {
+                "source_type": m.source_type,
+                "source_url": m.source_url,
+                "port": m.port,
+                "endpoint": m.endpoint,
+                "image_tag": m.image_tag,
+                "route_patterns": m.route_patterns,
+            },
+            "running": False,
         }
+
+    # If container manager is active, overlay running status
+    if container_manager:
+        for name in container_manager.running:
+            if name in result["containers"]:
+                result["containers"][name]["running"] = True
+
     return result
