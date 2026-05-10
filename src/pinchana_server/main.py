@@ -97,7 +97,10 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
     endpoint = module.endpoint
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
         return ScrapeResponse(**resp.json())
 
 
