@@ -11,6 +11,7 @@ from pinchana_core.models import ScrapeRequest, ScrapeResponse
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
 from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
+from pinchana_core.vpn import GluetunController, VpnRotationError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ if os.getenv("CONTAINER_MODE", "false").lower() in ("1", "true", "yes"):
         logger.info("Container manager initialized with %d modules", len(container_manager.modules))
     except Exception as e:
         logger.warning("Container manager failed to initialize: %s", e)
+
+gluetun = GluetunController()
 
 # ---------------------------------------------------------------------------
 # 4. FastAPI app
@@ -175,6 +178,32 @@ async def health_check():
         raise HTTPException(status_code=503, detail=results)
 
     return {"status": "healthy", "modules": results}
+
+
+# ---------------------------------------------------------------------------
+# Admin routes for VPN management
+# ---------------------------------------------------------------------------
+@app.post("/admin/vpn/rotate")
+async def admin_rotate_vpn():
+    """Manually trigger a VPN IP rotation via Gluetun."""
+    try:
+        await gluetun.rotate_ip()
+        return {"status": "rotated"}
+    except VpnRotationError as e:
+        raise HTTPException(status_code=503, detail=f"VPN rotation failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error during rotation: {e}")
+
+
+@app.get("/admin/vpn/status")
+async def admin_vpn_status():
+    """Return current Gluetun VPN connection status."""
+    try:
+        status = await gluetun.get_vpn_status()
+        public_ip = await gluetun.get_public_ip()
+        return {"vpn": status, "public_ip": public_ip}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Failed to query VPN status: {e}")
 
 
 # ---------------------------------------------------------------------------
