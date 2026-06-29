@@ -100,6 +100,10 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
+            logger.error(
+                "Upstream module %s (%s) returned %s for /scrape: %s",
+                module_name, endpoint, resp.status_code, resp.text,
+            )
             raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
         return ScrapeResponse(**resp.json())
 
