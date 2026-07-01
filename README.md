@@ -1,5 +1,8 @@
 # 🚀 Pinchana Server
 
+> [!WARNING]
+> The Live Photo implementation on this branch currently does not work at all. It is exploration and experimentation for TikTok Live Photo scraping behavior, not production-ready functionality.
+
 **Pinchana Server** is the central gateway for the Pinchana scraping ecosystem. It acts as a unified HTTP entry point, routing incoming requests to specialized scraper modules based on URL patterns.
 
 ---

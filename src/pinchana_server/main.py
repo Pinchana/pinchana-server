@@ -96,7 +96,7 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
 
     endpoint = module.endpoint
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
+        resp = await client.post(f"{endpoint}/scrape", json=request.model_dump(mode="json"))
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -129,7 +129,7 @@ async def process_scrape_request(request: ScrapeRequest):
         # Direct internal call via TestClient to keep the scraper self-contained
         from fastapi.testclient import TestClient
         client = TestClient(app)
-        resp = client.post(f"/{name}/scrape", json={"url": url})
+        resp = client.post(f"/{name}/scrape", json=request.model_dump(mode="json"))
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return ScrapeResponse(**resp.json())
