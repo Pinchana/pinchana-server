@@ -2,6 +2,8 @@
 
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -59,7 +61,31 @@ storage = MediaStorage(
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
 
-app = FastAPI(title="Pinchana Server", version="1.0.0")
+forward_client: httpx.AsyncClient | None = None
+internal_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global forward_client, internal_client
+    forward_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    )
+    internal_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://pinchana.internal",
+        timeout=120.0,
+    )
+    try:
+        yield
+    finally:
+        await forward_client.aclose()
+        await internal_client.aclose()
+        await storage.close()
+
+
+app = FastAPI(title="Pinchana Server", version="1.0.0", lifespan=lifespan)
 
 # Mount in-process plugin routers (if any)
 for name, plugin in registry.items():
@@ -95,17 +121,18 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
         raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
 
     endpoint = module.endpoint
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "Upstream module %s (%s) returned %s for /scrape: %s",
-                module_name, endpoint, resp.status_code, resp.text,
-            )
-            raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
-        return ScrapeResponse(**resp.json())
+    if forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    resp = await forward_client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "Upstream module %s (%s) returned %s for /scrape: %s",
+            module_name, endpoint, resp.status_code, resp.text,
+        )
+        raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
+    return ScrapeResponse(**resp.json())
 
 
 # ---------------------------------------------------------------------------
@@ -125,17 +152,21 @@ async def process_scrape_request(request: ScrapeRequest):
                    f"Containers: {[{n: m.route_patterns} for n, m in container_registry.modules.items()]}"
         )
 
+    started = time.perf_counter()
     if mode == "in_process":
-        # Direct internal call via TestClient to keep the scraper self-contained
-        from fastapi.testclient import TestClient
-        client = TestClient(app)
-        resp = client.post(f"/{name}/scrape", json={"url": url})
+        if internal_client is None:
+            raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
+        resp = await internal_client.post(f"/{name}/scrape", json={"url": url})
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        return ScrapeResponse(**resp.json())
+        result = ScrapeResponse(**resp.json())
+        logger.info("scrape_complete module=%s mode=%s elapsed_ms=%.1f", name, mode, (time.perf_counter() - started) * 1000)
+        return result
 
     # container
-    return await _forward_to_container(name, request)
+    result = await _forward_to_container(name, request)
+    logger.info("scrape_complete module=%s mode=%s elapsed_ms=%.1f", name, mode, (time.perf_counter() - started) * 1000)
+    return result
 
 
 @app.get("/media/{platform}/{post_id}/{filename:path}")
@@ -162,10 +193,10 @@ async def health_check():
 
     # In-process plugins
     for name, plugin in registry.items():
-        from fastapi.testclient import TestClient
-        client = TestClient(app)
         try:
-            resp = client.get(f"/{name}/health")
+            if internal_client is None:
+                raise RuntimeError("Internal HTTP client is not ready")
+            resp = await internal_client.get(f"/{name}/health")
             resp.raise_for_status()
             results[name] = {"mode": "in_process", "status": "healthy", "detail": resp.json()}
         except Exception as e:
