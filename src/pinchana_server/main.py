@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 import httpx
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
@@ -123,6 +123,10 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
     endpoint = module.endpoint
     if forward_client is None:
         raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    logger.info(
+        "scrape_forward module=%s endpoint=%s url=%s",
+        module_name, endpoint, request.url,
+    )
     resp = await forward_client.post(f"{endpoint}/scrape", json={"url": str(request.url)})
     try:
         resp.raise_for_status()
@@ -139,25 +143,50 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
 # Routes
 # ---------------------------------------------------------------------------
 @app.post("/scrape", response_model=ScrapeResponse)
-async def process_scrape_request(request: ScrapeRequest):
+async def process_scrape_request(request: ScrapeRequest, http_request: Request):
     """Unified scrape endpoint — routes to plugin or container module."""
     url = str(request.url)
+    client = http_request.client
+    client_address = f"{client.host}:{client.port}" if client else "unknown"
+    logger.info("scrape_request client=%s url=%s", client_address, url)
+
     mode, name, target = _resolve_module(url)
 
     if mode is None:
+        plugin_patterns = {
+            plugin_name: plugin.route_patterns
+            for plugin_name, plugin in registry.items()
+        }
+        container_patterns = {
+            module_name: module.route_patterns
+            for module_name, module in container_registry.modules.items()
+        }
+        logger.warning(
+            "scrape_rejected reason=no_matching_module client=%s url=%s "
+            "plugin_patterns=%s container_patterns=%s",
+            client_address, url, plugin_patterns, container_patterns,
+        )
         raise HTTPException(
             status_code=400,
             detail="No module handles this URL. "
-                   f"Plugins: {[p.route_patterns for p in registry._plugins.values()]}  "
-                   f"Containers: {[{n: m.route_patterns} for n, m in container_registry.modules.items()]}"
+                   f"Plugins: {plugin_patterns}  "
+                   f"Containers: {container_patterns}"
         )
 
+    logger.info(
+        "scrape_route_selected client=%s url=%s module=%s mode=%s patterns=%s",
+        client_address, url, name, mode, target.route_patterns,
+    )
     started = time.perf_counter()
     if mode == "in_process":
         if internal_client is None:
             raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
         resp = await internal_client.post(f"/{name}/scrape", json={"url": url})
         if resp.status_code != 200:
+            logger.error(
+                "scrape_upstream_error module=%s mode=%s status=%s body=%s",
+                name, mode, resp.status_code, resp.text,
+            )
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         result = ScrapeResponse(**resp.json())
         logger.info("scrape_complete module=%s mode=%s elapsed_ms=%.1f", name, mode, (time.perf_counter() - started) * 1000)
