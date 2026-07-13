@@ -36,6 +36,15 @@ Routes the URL to the appropriate scraper.
   "url": "https://www.tiktok.com/..."
 }
 ```
+Requires the `X-API-Key` header. Named keys are supplied through the `PINCHANA_API_KEYS` JSON environment variable.
+
+### Web routes
+
+- `POST /web/verify` validates a Turnstile token directly with Cloudflare Siteverify and returns a signed browser-session token.
+- `GET /web/identity` exposes the project-issued certificate used by the official web client to authorize a custom API origin.
+- `GET /web/session` validates that token.
+- `POST /web/scrape` performs a scrape with the browser-session bearer token.
+- `GET /web/media/...` serves protected media to a verified web session.
 
 ### `GET /health`
 Returns the status of the gateway and the VPN.
@@ -55,6 +64,10 @@ Returns a list of all configured modules and their status.
 | `CONTAINER_MODE` | `false` | Enable Docker container management features. |
 | `MODULES_CONFIG` | `/app/config/modules.yaml` | Path to the module routing configuration. |
 | `CACHE_PATH` | `./cache` | Base path for serving cached media. |
+| `PINCHANA_INSTANCE_CERTIFICATE` | unset | Project-issued JSON certificate envelope for this public origin. |
+| `PINCHANA_INSTANCE_CERTIFICATE_FILE` | unset | Mounted certificate file used instead of the inline value. |
+
+See [Instance certificates](../docs/INSTANCE_TRUST.md) for issuance and security boundaries.
 
 ---
 
