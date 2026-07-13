@@ -12,12 +12,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
@@ -88,6 +89,23 @@ class WebVerifyRequest(BaseModel):
 class WebSessionResponse(BaseModel):
     access_token: str
     expires_at: int
+
+
+class DlpCookiesEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[2]
+    keyId: str = Field(min_length=8, max_length=128)
+    clientPubKey: str = Field(min_length=40, max_length=64)
+    salt: str = Field(min_length=20, max_length=64)
+    iv: str = Field(min_length=12, max_length=32)
+    ciphertext: str = Field(min_length=20, max_length=480_000)
+
+
+class DlpSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=10, max_length=2048)
+    quality: Literal["best", "1080p", "720p", "480p", "360p", "audio"] = "best"
+    cookiesEnc: DlpCookiesEnvelope | None = None
 
 
 def _configured_api_keys() -> dict[str, str]:
@@ -176,6 +194,57 @@ def _require_web_session(authorization: str | None = Header(default=None)) -> di
     if scheme.lower() != "bearer" or not token:
         raise HTTPException(status_code=401, detail="Invalid or missing web session")
     return _validate_web_session(token)
+
+
+def _dlp_enabled() -> bool:
+    return os.getenv("DLP_ENABLED", "false").lower() in {"1", "true", "yes"}
+
+
+def _dlp_config() -> tuple[str, str]:
+    url = os.getenv("DLP_URL", "").rstrip("/")
+    token = os.getenv("DLP_GATEWAY_TOKEN", "")
+    if not _dlp_enabled() or not url or len(token) < 24:
+        raise HTTPException(status_code=503, detail="Private downloads are unavailable")
+    return url, token
+
+
+def _dlp_job_owner(claims: dict[str, Any]) -> str:
+    nonce = claims.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        raise HTTPException(status_code=401, detail="Invalid web session")
+    owner_secret = os.getenv("DLP_OWNER_SECRET", "").encode("utf-8") or _session_secret()
+    return _urlsafe_encode(hmac.new(owner_secret, nonce.encode("utf-8"), hashlib.sha256).digest())
+
+
+def _dlp_headers(claims: dict[str, Any]) -> dict[str, str]:
+    _url, token = _dlp_config()
+    return {"x-dlp-service-token": token, "x-job-owner": _dlp_job_owner(claims)}
+
+
+async def _dlp_json(method: str, path: str, claims: dict[str, Any], body: dict[str, Any] | None = None):
+    if forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    url, _token = _dlp_config()
+    try:
+        response = await forward_client.request(
+            method,
+            f"{url}{path}",
+            headers=_dlp_headers(claims),
+            json=body,
+            timeout=httpx.Timeout(30, connect=5),
+        )
+    except httpx.RequestError as exc:
+        logger.warning("dlp_upstream_unavailable path=%s error=%s", path, type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Private downloads are temporarily unavailable") from exc
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail", "Private download request failed")
+        except (ValueError, AttributeError):
+            detail = "Private download request failed"
+        if response.status_code >= 500:
+            detail = "Private downloads are temporarily unavailable"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    return response.json()
 
 
 def _turnstile_rejection_reason(result: Any, *, enforce_metadata: bool = True) -> str | None:
@@ -452,6 +521,67 @@ async def web_verify(request: WebVerifyRequest):
 @app.get("/web/session")
 async def web_session(claims: dict[str, Any] = Depends(_require_web_session)):
     return {"valid": True, "expires_at": claims["exp"]}
+
+
+@app.get("/web/capabilities")
+async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
+    """Advertise optional browser features without exposing service topology."""
+    available = _dlp_enabled() and bool(os.getenv("DLP_URL", "")) and len(os.getenv("DLP_GATEWAY_TOKEN", "")) >= 24
+    return {
+        "dlp": {
+            "available": available,
+            "protocol": 2 if available else None,
+            "qualities": ["best", "1080p", "720p", "480p", "360p", "audio"] if available else [],
+        }
+    }
+
+
+@app.post("/web/dlp/jobs")
+async def web_dlp_allocate(claims: dict[str, Any] = Depends(_require_web_session)):
+    return await _dlp_json("POST", "/v2/jobs", claims)
+
+
+@app.post("/web/dlp/jobs/{job_id}/submit")
+async def web_dlp_submit(
+    job_id: uuid.UUID,
+    request: DlpSubmitRequest,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    return await _dlp_json("POST", f"/v2/jobs/{job_id}/submit", claims, request.model_dump(mode="json"))
+
+
+@app.get("/web/dlp/jobs/{job_id}")
+async def web_dlp_status(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_require_web_session)):
+    return await _dlp_json("GET", f"/v2/jobs/{job_id}", claims)
+
+
+@app.get("/web/dlp/jobs/{job_id}/file")
+async def web_dlp_file(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_require_web_session)):
+    if forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    url, _token = _dlp_config()
+    try:
+        upstream_request = forward_client.build_request(
+            "GET", f"{url}/v2/jobs/{job_id}/file", headers=_dlp_headers(claims)
+        )
+        upstream = await forward_client.send(upstream_request, stream=True)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail="Private download is temporarily unavailable") from exc
+    if upstream.status_code >= 400:
+        await upstream.aclose()
+        raise HTTPException(status_code=upstream.status_code, detail="Private download file is unavailable")
+    headers = {
+        name: value
+        for name, value in upstream.headers.items()
+        if name.lower() in {"content-type", "content-length", "content-disposition"}
+    }
+    headers["Cache-Control"] = "no-store"
+    return StreamingResponse(
+        upstream.aiter_raw(),
+        status_code=upstream.status_code,
+        headers=headers,
+        background=BackgroundTask(upstream.aclose),
+    )
 
 
 @app.post("/web/scrape", response_model=ScrapeResponse)
