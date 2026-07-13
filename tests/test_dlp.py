@@ -10,6 +10,9 @@ from pinchana_server.main import (
     DlpSubmitRequest,
     _dlp_headers,
     _dlp_job_owner,
+    _require_api_key,
+    _require_web_session,
+    app,
     web_capabilities,
 )
 
@@ -77,3 +80,12 @@ def test_gateway_rejects_raw_format_and_unknown_quality():
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", codec="custom")
     with pytest.raises(ValidationError):
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", container="avi")
+
+
+def test_dlp_routes_accept_only_signed_web_sessions_not_machine_keys():
+    dlp_routes = [route for route in app.routes if getattr(route, "path", "").startswith("/web/dlp")]
+    assert dlp_routes
+    for route in dlp_routes:
+        dependency_calls = {dependency.call for dependency in route.dependant.dependencies}
+        assert _require_web_session in dependency_calls
+        assert _require_api_key not in dependency_calls
