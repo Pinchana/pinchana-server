@@ -200,10 +200,22 @@ def _dlp_enabled() -> bool:
     return os.getenv("DLP_ENABLED", "false").lower() in {"1", "true", "yes"}
 
 
+def _valid_dlp_secret(value: str) -> bool:
+    lowered = value.lower()
+    return len(value) >= 32 and "replace-with" not in lowered and "disabled-change-me" not in lowered
+
+
 def _dlp_config() -> tuple[str, str]:
     url = os.getenv("DLP_URL", "").rstrip("/")
     token = os.getenv("DLP_GATEWAY_TOKEN", "")
-    if not _dlp_enabled() or not url or len(token) < 24:
+    owner_secret = os.getenv("DLP_OWNER_SECRET", "")
+    if (
+        not _dlp_enabled()
+        or not url
+        or not _valid_dlp_secret(token)
+        or not _valid_dlp_secret(owner_secret)
+        or hmac.compare_digest(token, owner_secret)
+    ):
         raise HTTPException(status_code=503, detail="Private downloads are unavailable")
     return url, token
 
@@ -214,6 +226,20 @@ def _dlp_job_owner(claims: dict[str, Any]) -> str:
         raise HTTPException(status_code=401, detail="Invalid web session")
     owner_secret = os.getenv("DLP_OWNER_SECRET", "").encode("utf-8") or _session_secret()
     return _urlsafe_encode(hmac.new(owner_secret, nonce.encode("utf-8"), hashlib.sha256).digest())
+
+
+async def _dlp_healthy() -> bool:
+    if forward_client is None:
+        return False
+    try:
+        url, _token = _dlp_config()
+        response = await forward_client.get(f"{url}/health", timeout=httpx.Timeout(3, connect=2))
+        if response.status_code != 200:
+            return False
+        payload = response.json()
+        return payload.get("status") == "ok" and payload.get("protocol") == 2 and payload.get("redis") is True
+    except (HTTPException, httpx.RequestError, ValueError, AttributeError):
+        return False
 
 
 def _dlp_headers(claims: dict[str, Any]) -> dict[str, str]:
@@ -526,7 +552,7 @@ async def web_session(claims: dict[str, Any] = Depends(_require_web_session)):
 @app.get("/web/capabilities")
 async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
     """Advertise optional browser features without exposing service topology."""
-    available = _dlp_enabled() and bool(os.getenv("DLP_URL", "")) and len(os.getenv("DLP_GATEWAY_TOKEN", "")) >= 24
+    available = await _dlp_healthy() if _dlp_enabled() else False
     return {
         "dlp": {
             "available": available,

@@ -1,6 +1,6 @@
 import asyncio
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -41,12 +41,22 @@ def test_job_owner_requires_signed_session_nonce():
 
 
 def test_capability_is_feature_gated():
-    with patch.dict(os.environ, ENVIRONMENT, clear=False):
+    with patch.dict(os.environ, ENVIRONMENT, clear=False), patch(
+        "pinchana_server.main._dlp_healthy", AsyncMock(return_value=True)
+    ):
         enabled = asyncio.run(web_capabilities({"nonce": "n"}))
     assert enabled["dlp"]["available"] is True
     with patch.dict(os.environ, {**ENVIRONMENT, "DLP_ENABLED": "false"}, clear=False):
         disabled = asyncio.run(web_capabilities({"nonce": "n"}))
     assert disabled["dlp"] == {"available": False, "protocol": None, "qualities": []}
+
+
+def test_capability_fails_closed_when_dlp_is_unhealthy():
+    with patch.dict(os.environ, ENVIRONMENT, clear=False), patch(
+        "pinchana_server.main._dlp_healthy", AsyncMock(return_value=False)
+    ):
+        result = asyncio.run(web_capabilities({"nonce": "n"}))
+    assert result["dlp"]["available"] is False
 
 
 def test_gateway_rejects_raw_format_and_unknown_quality():
