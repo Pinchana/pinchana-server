@@ -46,9 +46,18 @@ def test_capability_is_feature_gated():
     ):
         enabled = asyncio.run(web_capabilities({"nonce": "n"}))
     assert enabled["dlp"]["available"] is True
+    assert "4k" in enabled["dlp"]["qualities"]
+    assert enabled["dlp"]["codecs"] == ["auto", "h264", "av1", "vp9"]
+    assert enabled["dlp"]["containers"] == ["auto", "mp4", "webm", "mkv"]
     with patch.dict(os.environ, {**ENVIRONMENT, "DLP_ENABLED": "false"}, clear=False):
         disabled = asyncio.run(web_capabilities({"nonce": "n"}))
-    assert disabled["dlp"] == {"available": False, "protocol": None, "qualities": []}
+    assert disabled["dlp"] == {
+        "available": False,
+        "protocol": None,
+        "qualities": [],
+        "codecs": [],
+        "containers": [],
+    }
 
 
 def test_capability_fails_closed_when_dlp_is_unhealthy():
@@ -64,3 +73,7 @@ def test_gateway_rejects_raw_format_and_unknown_quality():
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", quality="best", format="raw")
     with pytest.raises(ValidationError):
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", quality="unbounded")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", codec="custom")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", container="avi")

@@ -104,7 +104,11 @@ class DlpCookiesEnvelope(BaseModel):
 class DlpSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     url: str = Field(min_length=10, max_length=2048)
-    quality: Literal["best", "1080p", "720p", "480p", "360p", "audio"] = "best"
+    quality: Literal[
+        "best", "8k", "4k", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "audio"
+    ] = "best"
+    codec: Literal["auto", "h264", "av1", "vp9"] = "auto"
+    container: Literal["auto", "mp4", "webm", "mkv"] = "auto"
     cookiesEnc: DlpCookiesEnvelope | None = None
 
 
@@ -557,7 +561,11 @@ async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_sessio
         "dlp": {
             "available": available,
             "protocol": 2 if available else None,
-            "qualities": ["best", "1080p", "720p", "480p", "360p", "audio"] if available else [],
+            "qualities": [
+                "best", "8k", "4k", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "audio"
+            ] if available else [],
+            "codecs": ["auto", "h264", "av1", "vp9"] if available else [],
+            "containers": ["auto", "mp4", "webm", "mkv"] if available else [],
         }
     }
 
