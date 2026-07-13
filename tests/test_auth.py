@@ -13,6 +13,7 @@ from pinchana_server.main import (
     _configured_api_keys,
     _issue_web_session,
     _rewrite_media_urls,
+    _turnstile_rejection_reason,
     _valid_turnstile_result,
     _validate_web_session,
     web_identity,
@@ -84,6 +85,58 @@ class GatewayAuthTests(unittest.TestCase):
                     enforce_metadata=False,
                 )
             )
+
+    def test_turnstile_rejections_are_classified(self):
+        environment = {
+            "TURNSTILE_EXPECTED_HOSTNAME": "pinchana.example.com",
+            "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
+        }
+        valid = {
+            "success": True,
+            "hostname": "pinchana.example.com",
+            "action": "turnstile-spin-v1",
+        }
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(_turnstile_rejection_reason(valid))
+            self.assertEqual(
+                _turnstile_rejection_reason({**valid, "hostname": "attacker.example"}),
+                "hostname-mismatch",
+            )
+            self.assertEqual(
+                _turnstile_rejection_reason({**valid, "action": "different"}),
+                "action-mismatch",
+            )
+            self.assertEqual(
+                _turnstile_rejection_reason({"success": False, "error-codes": ["timeout-or-duplicate"]}),
+                "cloudflare-rejected",
+            )
+
+    def test_web_verify_logs_siteverify_rejection_reason(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "success": True,
+            "hostname": "wrong.example.com",
+            "action": "turnstile-spin-v1",
+        }
+        client = Mock()
+        client.post = AsyncMock(return_value=response)
+        environment = {
+            "TURNSTILE_SECRET_KEY": "private-secret",
+            "TURNSTILE_EXPECTED_HOSTNAME": "pinchana.example.com",
+            "TURNSTILE_EXPECTED_ACTION": "turnstile-spin-v1",
+            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch("pinchana_server.main.forward_client", client),
+            self.assertLogs("pinchana_server.main", level="INFO") as captured,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(web_verify(WebVerifyRequest(token="browser-token")))
+
+        self.assertEqual(raised.exception.status_code, 403)
+        self.assertTrue(any("reason=hostname-mismatch" in message for message in captured.output))
 
     def test_web_verify_calls_cloudflare_siteverify_directly(self):
         response = Mock()

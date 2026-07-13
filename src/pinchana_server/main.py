@@ -178,18 +178,27 @@ def _require_web_session(authorization: str | None = Header(default=None)) -> di
     return _validate_web_session(token)
 
 
-def _valid_turnstile_result(result: Any, *, enforce_metadata: bool = True) -> bool:
-    if not isinstance(result, dict) or result.get("success") is not True:
-        return False
+def _turnstile_rejection_reason(result: Any, *, enforce_metadata: bool = True) -> str | None:
+    if not isinstance(result, dict):
+        return "invalid-response"
+    if result.get("success") is not True:
+        error_codes = result.get("error-codes")
+        if isinstance(error_codes, list) and error_codes:
+            return "cloudflare-rejected"
+        return "unsuccessful"
     if not enforce_metadata:
-        return True
+        return None
     expected_hostname = os.getenv("TURNSTILE_EXPECTED_HOSTNAME", "").strip()
     if expected_hostname and result.get("hostname") != expected_hostname:
-        return False
+        return "hostname-mismatch"
     expected_action = os.getenv("TURNSTILE_EXPECTED_ACTION", "turnstile-spin-v1").strip()
     if expected_action and result.get("action") != expected_action:
-        return False
-    return True
+        return "action-mismatch"
+    return None
+
+
+def _valid_turnstile_result(result: Any, *, enforce_metadata: bool = True) -> bool:
+    return _turnstile_rejection_reason(result, enforce_metadata=enforce_metadata) is None
 
 
 @asynccontextmanager
@@ -423,9 +432,18 @@ async def web_verify(request: WebVerifyRequest):
         logger.warning("turnstile_verification_unavailable: %s", exc)
         raise HTTPException(status_code=503, detail="Verification service unavailable") from exc
     enforce_metadata = secret_key not in TURNSTILE_TEST_SECRET_KEYS
-    if not _valid_turnstile_result(result, enforce_metadata=enforce_metadata):
+    rejection_reason = _turnstile_rejection_reason(result, enforce_metadata=enforce_metadata)
+    if rejection_reason is not None:
         error_codes = result.get("error-codes", []) if isinstance(result, dict) else []
-        logger.info("turnstile_verification_rejected error_codes=%s", error_codes)
+        hostname = result.get("hostname") if isinstance(result, dict) else None
+        action = result.get("action") if isinstance(result, dict) else None
+        logger.info(
+            "turnstile_verification_rejected reason=%s error_codes=%s hostname=%s action=%s",
+            rejection_reason,
+            error_codes,
+            hostname,
+            action,
+        )
         raise HTTPException(status_code=403, detail="Verification failed")
     access_token, expires_at = _issue_web_session()
     return WebSessionResponse(access_token=access_token, expires_at=expires_at)
