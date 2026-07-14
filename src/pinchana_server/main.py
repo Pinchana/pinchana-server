@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
@@ -33,6 +33,15 @@ TURNSTILE_TEST_SECRET_KEYS = {
     "1x0000000000000000000000000000000AA",
     "2x0000000000000000000000000000000AA",
     "3x0000000000000000000000000000000AA",
+}
+YOUTUBE_DUB_LANGUAGES = {
+    "af", "az", "id", "ms", "bs", "ca", "cs", "da", "de", "et", "en-IN", "en-GB", "en",
+    "es", "es-419", "es-US", "eu", "fil", "fr", "fr-CA", "gl", "hr", "zu", "is", "it", "sw",
+    "lv", "lt", "hu", "nl", "no", "uz", "pl", "pt-PT", "pt", "ro", "sq", "sk", "sl",
+    "sr-Latn", "fi", "sv", "vi", "tr", "be", "bg", "ky", "kk", "mk", "mn", "ru", "sr", "uk",
+    "el", "hy", "iw", "ur", "ar", "fa", "ne", "mr", "hi", "as", "bn", "pa", "gu", "or", "ta",
+    "te", "kn", "ml", "si", "th", "lo", "my", "ka", "am", "km", "zh-CN", "zh-TW", "zh-HK",
+    "ja", "ko",
 }
 
 # ---------------------------------------------------------------------------
@@ -109,7 +118,18 @@ class DlpSubmitRequest(BaseModel):
     ] = "best"
     codec: Literal["auto", "h264", "av1", "vp9"] = "auto"
     container: Literal["auto", "mp4", "webm", "mkv"] = "auto"
+    audioFormat: Literal["best", "mp3", "ogg", "wav", "opus"] = "best"
+    audioBitrate: Literal["320", "256", "128", "96", "64", "8"] = "128"
+    preferBetterAudio: bool = False
+    dubLanguage: str = Field(default="original", min_length=2, max_length=16)
     cookiesEnc: DlpCookiesEnvelope | None = None
+
+    @field_validator("dubLanguage")
+    @classmethod
+    def valid_dub_language(cls, value: str) -> str:
+        if value != "original" and value not in YOUTUBE_DUB_LANGUAGES:
+            raise ValueError("unsupported YouTube dub language")
+        return value
 
 
 def _configured_api_keys() -> dict[str, str]:
@@ -232,18 +252,32 @@ def _dlp_job_owner(claims: dict[str, Any]) -> str:
     return _urlsafe_encode(hmac.new(owner_secret, nonce.encode("utf-8"), hashlib.sha256).digest())
 
 
-async def _dlp_healthy() -> bool:
+async def _dlp_capabilities() -> dict[str, Any] | None:
     if forward_client is None:
-        return False
+        return None
     try:
         url, _token = _dlp_config()
         response = await forward_client.get(f"{url}/health", timeout=httpx.Timeout(3, connect=2))
         if response.status_code != 200:
-            return False
+            return None
         payload = response.json()
-        return payload.get("status") == "ok" and payload.get("protocol") == 2 and payload.get("redis") is True
+        if payload.get("status") != "ok" or payload.get("protocol") != 2 or payload.get("redis") is not True:
+            return None
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return None
+        required_lists = ("services", "qualities", "codecs", "containers", "audioFormats", "audioBitrates", "dubLanguages")
+        if any(not isinstance(capabilities.get(field), list) for field in required_lists):
+            return None
+        if capabilities.get("betterAudio") is not True or capabilities.get("services") != ["youtube"]:
+            return None
+        return capabilities
     except (HTTPException, httpx.RequestError, ValueError, AttributeError):
-        return False
+        return None
+
+
+async def _dlp_healthy() -> bool:
+    return await _dlp_capabilities() is not None
 
 
 def _dlp_headers(claims: dict[str, Any]) -> dict[str, str]:
@@ -556,16 +590,20 @@ async def web_session(claims: dict[str, Any] = Depends(_require_web_session)):
 @app.get("/web/capabilities")
 async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
     """Advertise optional browser features without exposing service topology."""
-    available = await _dlp_healthy() if _dlp_enabled() else False
+    capabilities = await _dlp_capabilities() if _dlp_enabled() else None
+    available = capabilities is not None
     return {
         "dlp": {
             "available": available,
             "protocol": 2 if available else None,
-            "qualities": [
-                "best", "8k", "4k", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "audio"
-            ] if available else [],
-            "codecs": ["auto", "h264", "av1", "vp9"] if available else [],
-            "containers": ["auto", "mp4", "webm", "mkv"] if available else [],
+            "services": capabilities["services"] if capabilities else [],
+            "qualities": capabilities["qualities"] if capabilities else [],
+            "codecs": capabilities["codecs"] if capabilities else [],
+            "containers": capabilities["containers"] if capabilities else [],
+            "audioFormats": capabilities["audioFormats"] if capabilities else [],
+            "audioBitrates": capabilities["audioBitrates"] if capabilities else [],
+            "dubLanguages": capabilities["dubLanguages"] if capabilities else [],
+            "betterAudio": capabilities["betterAudio"] if capabilities else False,
         }
     }
 

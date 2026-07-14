@@ -24,6 +24,16 @@ ENVIRONMENT = {
     "DLP_GATEWAY_TOKEN": "g" * 32,
     "DLP_OWNER_SECRET": "o" * 32,
 }
+CAPABILITIES = {
+    "services": ["youtube"],
+    "qualities": ["best", "4k", "audio"],
+    "codecs": ["auto", "h264", "av1", "vp9"],
+    "containers": ["auto", "mp4", "webm", "mkv"],
+    "audioFormats": ["best", "mp3", "ogg", "wav", "opus"],
+    "audioBitrates": ["320", "256", "128", "96", "64", "8"],
+    "dubLanguages": ["en", "de", "fr"],
+    "betterAudio": True,
+}
 
 
 def test_job_owner_is_stable_and_nonce_bound():
@@ -45,27 +55,36 @@ def test_job_owner_requires_signed_session_nonce():
 
 def test_capability_is_feature_gated():
     with patch.dict(os.environ, ENVIRONMENT, clear=False), patch(
-        "pinchana_server.main._dlp_healthy", AsyncMock(return_value=True)
+        "pinchana_server.main._dlp_capabilities", AsyncMock(return_value=CAPABILITIES)
     ):
         enabled = asyncio.run(web_capabilities({"nonce": "n"}))
     assert enabled["dlp"]["available"] is True
     assert "4k" in enabled["dlp"]["qualities"]
     assert enabled["dlp"]["codecs"] == ["auto", "h264", "av1", "vp9"]
     assert enabled["dlp"]["containers"] == ["auto", "mp4", "webm", "mkv"]
+    assert enabled["dlp"]["services"] == ["youtube"]
+    assert enabled["dlp"]["audioFormats"] == ["best", "mp3", "ogg", "wav", "opus"]
+    assert enabled["dlp"]["dubLanguages"] == ["en", "de", "fr"]
+    assert enabled["dlp"]["betterAudio"] is True
     with patch.dict(os.environ, {**ENVIRONMENT, "DLP_ENABLED": "false"}, clear=False):
         disabled = asyncio.run(web_capabilities({"nonce": "n"}))
     assert disabled["dlp"] == {
         "available": False,
         "protocol": None,
+        "services": [],
         "qualities": [],
         "codecs": [],
         "containers": [],
+        "audioFormats": [],
+        "audioBitrates": [],
+        "dubLanguages": [],
+        "betterAudio": False,
     }
 
 
 def test_capability_fails_closed_when_dlp_is_unhealthy():
     with patch.dict(os.environ, ENVIRONMENT, clear=False), patch(
-        "pinchana_server.main._dlp_healthy", AsyncMock(return_value=False)
+        "pinchana_server.main._dlp_capabilities", AsyncMock(return_value=None)
     ):
         result = asyncio.run(web_capabilities({"nonce": "n"}))
     assert result["dlp"]["available"] is False
@@ -80,6 +99,12 @@ def test_gateway_rejects_raw_format_and_unknown_quality():
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", codec="custom")
     with pytest.raises(ValidationError):
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", container="avi")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", audioFormat="flac")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", audioBitrate="192")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", dubLanguage="xx-invalid")
 
 
 def test_dlp_routes_accept_only_signed_web_sessions_not_machine_keys():
