@@ -32,6 +32,8 @@ CAPABILITIES = {
     "audioFormats": ["best", "mp3", "ogg", "wav", "opus"],
     "audioBitrates": ["320", "256", "128", "96", "64", "8"],
     "dubLanguages": ["en", "de", "fr"],
+    "filenameStyles": ["classic", "basic", "pretty", "nerdy"],
+    "subtitleLanguages": ["en", "de", "fr"],
     "betterAudio": True,
 }
 
@@ -65,6 +67,8 @@ def test_capability_is_feature_gated():
     assert enabled["dlp"]["services"] == ["youtube"]
     assert enabled["dlp"]["audioFormats"] == ["best", "mp3", "ogg", "wav", "opus"]
     assert enabled["dlp"]["dubLanguages"] == ["en", "de", "fr"]
+    assert enabled["dlp"]["filenameStyles"] == ["classic", "basic", "pretty", "nerdy"]
+    assert enabled["dlp"]["subtitleLanguages"] == ["en", "de", "fr"]
     assert enabled["dlp"]["betterAudio"] is True
     with patch.dict(os.environ, {**ENVIRONMENT, "DLP_ENABLED": "false"}, clear=False):
         disabled = asyncio.run(web_capabilities({"nonce": "n"}))
@@ -78,6 +82,8 @@ def test_capability_is_feature_gated():
         "audioFormats": [],
         "audioBitrates": [],
         "dubLanguages": [],
+        "filenameStyles": [],
+        "subtitleLanguages": [],
         "betterAudio": False,
     }
 
@@ -105,6 +111,17 @@ def test_gateway_rejects_raw_format_and_unknown_quality():
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", audioBitrate="192")
     with pytest.raises(ValidationError):
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", dubLanguage="xx-invalid")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", filenameStyle="random")
+    with pytest.raises(ValidationError):
+        DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", subtitleLanguage="xx-invalid")
+
+
+def test_new_dlp_fields_remain_optional_for_staggered_rollout():
+    request = DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk")
+    payload = request.model_dump(mode="json", exclude_none=True)
+    assert "filenameStyle" not in payload
+    assert "subtitleLanguage" not in payload
 
 
 def test_dlp_routes_accept_only_signed_web_sessions_not_machine_keys():

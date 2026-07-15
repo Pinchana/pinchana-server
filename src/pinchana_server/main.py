@@ -43,6 +43,7 @@ YOUTUBE_DUB_LANGUAGES = {
     "te", "kn", "ml", "si", "th", "lo", "my", "ka", "am", "km", "zh-CN", "zh-TW", "zh-HK",
     "ja", "ko",
 }
+FILENAME_STYLES = {"classic", "basic", "pretty", "nerdy"}
 
 # ---------------------------------------------------------------------------
 # 1. In-process plugin discovery (optional — for local dev)
@@ -122,6 +123,8 @@ class DlpSubmitRequest(BaseModel):
     audioBitrate: Literal["320", "256", "128", "96", "64", "8"] = "128"
     preferBetterAudio: bool = False
     dubLanguage: str = Field(default="original", min_length=2, max_length=16)
+    filenameStyle: Literal["classic", "basic", "pretty", "nerdy"] | None = None
+    subtitleLanguage: str | None = Field(default=None, min_length=2, max_length=16)
     cookiesEnc: DlpCookiesEnvelope | None = None
 
     @field_validator("dubLanguage")
@@ -129,6 +132,13 @@ class DlpSubmitRequest(BaseModel):
     def valid_dub_language(cls, value: str) -> str:
         if value != "original" and value not in YOUTUBE_DUB_LANGUAGES:
             raise ValueError("unsupported YouTube dub language")
+        return value
+
+    @field_validator("subtitleLanguage")
+    @classmethod
+    def valid_subtitle_language(cls, value: str | None) -> str | None:
+        if value is not None and value != "none" and value not in YOUTUBE_DUB_LANGUAGES:
+            raise ValueError("unsupported YouTube subtitle language")
         return value
 
 
@@ -269,8 +279,13 @@ async def _dlp_capabilities() -> dict[str, Any] | None:
         required_lists = ("services", "qualities", "codecs", "containers", "audioFormats", "audioBitrates", "dubLanguages")
         if any(not isinstance(capabilities.get(field), list) for field in required_lists):
             return None
+        optional_lists = ("filenameStyles", "subtitleLanguages")
+        if any(field in capabilities and not isinstance(capabilities[field], list) for field in optional_lists):
+            return None
         if capabilities.get("betterAudio") is not True or capabilities.get("services") != ["youtube"]:
             return None
+        for field in optional_lists:
+            capabilities.setdefault(field, [])
         return capabilities
     except (HTTPException, httpx.RequestError, ValueError, AttributeError):
         return None
@@ -603,6 +618,8 @@ async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_sessio
             "audioFormats": capabilities["audioFormats"] if capabilities else [],
             "audioBitrates": capabilities["audioBitrates"] if capabilities else [],
             "dubLanguages": capabilities["dubLanguages"] if capabilities else [],
+            "filenameStyles": capabilities["filenameStyles"] if capabilities else [],
+            "subtitleLanguages": capabilities["subtitleLanguages"] if capabilities else [],
             "betterAudio": capabilities["betterAudio"] if capabilities else False,
         }
     }
@@ -619,7 +636,7 @@ async def web_dlp_submit(
     request: DlpSubmitRequest,
     claims: dict[str, Any] = Depends(_require_web_session),
 ):
-    return await _dlp_json("POST", f"/v2/jobs/{job_id}/submit", claims, request.model_dump(mode="json"))
+    return await _dlp_json("POST", f"/v2/jobs/{job_id}/submit", claims, request.model_dump(mode="json", exclude_none=True))
 
 
 @app.get("/web/dlp/jobs/{job_id}")
