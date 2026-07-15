@@ -43,9 +43,10 @@ Requires the `X-API-Key` header. Named keys are supplied through the `PINCHANA_A
 - `POST /web/verify` validates a Turnstile token directly with Cloudflare Siteverify and returns a signed browser-session token.
 - `GET /web/identity` exposes the project-issued certificate used by the official web client to authorize a custom API origin.
 - `GET /web/session` validates that token.
+- `GET /web/build` publicly exposes the sanitized source revisions included in the deployment; it never returns configuration or infrastructure details.
 - `POST /web/scrape` performs a scrape with the browser-session bearer token.
 - `GET /web/media/...` serves protected media to a verified web session.
-- `GET /web/capabilities` advertises optional protocol-v2 DLP support, including available filename styles and YouTube subtitle languages when the connected DLP service supports them.
+- `GET /web/capabilities` advertises optional protocol-v2 DLP support.
 - `/web/dlp/jobs...` allocates, submits, monitors, and streams owner-bound private-download jobs to the internal DLP service. The gateway forwards cookie ciphertext only.
 
 DLP is a separate asynchronous service, not a scraper module. It is disabled by default with `DLP_ENABLED=false`. When enabled, set independent `DLP_GATEWAY_TOKEN` and `DLP_OWNER_SECRET` values and keep `DLP_URL` reachable only on the internal gateway network.
@@ -70,6 +71,8 @@ Returns a list of all configured modules and their status.
 | `CACHE_PATH` | `./cache` | Base path for serving cached media. |
 | `PINCHANA_INSTANCE_CERTIFICATE` | unset | Project-issued JSON certificate envelope for this public origin. |
 | `PINCHANA_INSTANCE_CERTIFICATE_FILE` | unset | Mounted certificate file used instead of the inline value. |
+| `PINCHANA_BUILD_COMMIT` | unset | Parent API commit baked into official images; used as a manifest fallback. |
+| `PINCHANA_BUILD_COMMITS` | unset | JSON map of public API and module commits, normally baked by release CI. |
 
 See [Instance certificates](../docs/INSTANCE_TRUST.md) for issuance and security boundaries.
 

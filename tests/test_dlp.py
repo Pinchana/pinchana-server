@@ -1,19 +1,26 @@
 import asyncio
+import json
 import os
+import uuid
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
+from starlette.requests import Request
 
 from pinchana_server.main import (
     DlpSubmitRequest,
     _dlp_headers,
     _dlp_job_owner,
+    _public_build_manifest,
     _require_api_key,
     _require_web_session,
     app,
+    web_build,
     web_capabilities,
+    web_dlp_file,
 )
 
 
@@ -96,6 +103,30 @@ def test_capability_fails_closed_when_dlp_is_unhealthy():
     assert result["dlp"]["available"] is False
 
 
+def test_public_build_manifest_filters_untrusted_values():
+    manifest = json.dumps({
+        "api": {"commit": "A" * 40, "repository": "https://github.com/Pinchana/pinchana-api"},
+        "threads": {"commit": "b" * 40, "repository": "https://github.com/Pinchana/pinchana-threads"},
+        "bad name": {"commit": "c" * 40},
+        "secret": {"commit": "not-a-commit", "repository": "https://internal.example/repo"},
+    })
+    with patch.dict(os.environ, {"PINCHANA_BUILD_COMMITS": manifest}, clear=False):
+        result = _public_build_manifest()
+    assert result == {
+        "version": "preview",
+        "commits": {
+            "api": {"commit": "a" * 40, "repository": "https://github.com/Pinchana/pinchana-api"},
+            "threads": {"commit": "b" * 40, "repository": "https://github.com/Pinchana/pinchana-threads"},
+        },
+    }
+
+
+def test_public_build_endpoint_needs_no_session():
+    response = asyncio.run(web_build())
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "public, max-age=300"
+
+
 def test_gateway_rejects_raw_format_and_unknown_quality():
     with pytest.raises(ValidationError):
         DlpSubmitRequest(url="https://youtube.com/watch?v=abcdefghijk", quality="best", format="raw")
@@ -131,3 +162,78 @@ def test_dlp_routes_accept_only_signed_web_sessions_not_machine_keys():
         dependency_calls = {dependency.call for dependency in route.dependant.dependencies}
         assert _require_web_session in dependency_calls
         assert _require_api_key not in dependency_calls
+
+
+def test_private_file_forwards_range_and_partial_response_headers():
+    seen_headers = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_headers
+        seen_headers = request.headers
+        return httpx.Response(
+            206,
+            content=b"edi",
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Range": "bytes 1-3/5",
+                "Content-Length": "3",
+                "Content-Type": "video/mp4",
+                "Content-Disposition": 'attachment; filename="video [pinchana.cc].mp4"',
+                "ETag": '"private-video"',
+                "Last-Modified": "Wed, 15 Jul 2026 12:00:00 GMT",
+            },
+        )
+
+    async def exercise():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/web/dlp/jobs/12345678-1234-4234-9234-123456789abc/file",
+            "headers": [(b"range", b"bytes=1-3"), (b"if-range", b'"private-video"')],
+        })
+        with patch.dict(os.environ, ENVIRONMENT, clear=False), patch("pinchana_server.main.forward_client", client):
+            response = await web_dlp_file(
+                uuid.UUID("12345678-1234-4234-9234-123456789abc"),
+                request,
+                {"nonce": "session-one"},
+            )
+            await response.background()
+        await client.aclose()
+        return response
+
+    response = asyncio.run(exercise())
+    assert seen_headers is not None
+    assert seen_headers["range"] == "bytes=1-3"
+    assert seen_headers["if-range"] == '"private-video"'
+    assert response.status_code == 206
+    assert response.headers["content-range"] == "bytes 1-3/5"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_private_file_preserves_unsatisfied_range_response():
+    async def exercise():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(416, headers={"Content-Range": "*/5", "Accept-Ranges": "bytes"})
+        ))
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/web/dlp/jobs/12345678-1234-4234-9234-123456789abc/file",
+            "headers": [(b"range", b"bytes=10-20")],
+        })
+        with patch.dict(os.environ, ENVIRONMENT, clear=False), patch("pinchana_server.main.forward_client", client):
+            response = await web_dlp_file(
+                uuid.UUID("12345678-1234-4234-9234-123456789abc"),
+                request,
+                {"nonce": "session-one"},
+            )
+            await response.background()
+        await client.aclose()
+        return response
+
+    response = asyncio.run(exercise())
+    assert response.status_code == 416
+    assert response.headers["content-range"] == "*/5"

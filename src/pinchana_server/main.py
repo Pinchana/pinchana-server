@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -44,6 +45,9 @@ YOUTUBE_DUB_LANGUAGES = {
     "ja", "ko",
 }
 FILENAME_STYLES = {"classic", "basic", "pretty", "nerdy"}
+BUILD_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
+BUILD_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+BUILD_REPOSITORY_PATTERN = re.compile(r"^https://github\.com/Pinchana/[A-Za-z0-9_.-]+$")
 
 # ---------------------------------------------------------------------------
 # 1. In-process plugin discovery (optional — for local dev)
@@ -140,6 +144,45 @@ class DlpSubmitRequest(BaseModel):
         if value is not None and value != "none" and value not in YOUTUBE_DUB_LANGUAGES:
             raise ValueError("unsupported YouTube subtitle language")
         return value
+
+
+def _public_build_manifest() -> dict[str, Any]:
+    """Return only validated public source revisions from the baked manifest."""
+    raw_manifest = os.getenv("PINCHANA_BUILD_COMMITS", "").strip()
+    try:
+        parsed = json.loads(raw_manifest) if raw_manifest else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    fallback_commit = os.getenv("PINCHANA_BUILD_COMMIT", "").strip()
+    if BUILD_COMMIT_PATTERN.fullmatch(fallback_commit) and "api" not in parsed:
+        parsed["api"] = {
+            "commit": fallback_commit,
+            "repository": "https://github.com/Pinchana/pinchana-api",
+        }
+
+    commits: dict[str, dict[str, str]] = {}
+    for name, value in parsed.items():
+        if not isinstance(name, str) or not BUILD_NAME_PATTERN.fullmatch(name):
+            continue
+        if isinstance(value, str):
+            commit = value
+            repository = ""
+        elif isinstance(value, dict):
+            commit = value.get("commit", "")
+            repository = value.get("repository", "")
+        else:
+            continue
+        if not isinstance(commit, str) or not BUILD_COMMIT_PATTERN.fullmatch(commit):
+            continue
+        entry = {"commit": commit.lower()}
+        if isinstance(repository, str) and BUILD_REPOSITORY_PATTERN.fullmatch(repository):
+            entry["repository"] = repository
+        commits[name] = entry
+
+    return {"version": "preview", "commits": commits}
 
 
 def _configured_api_keys() -> dict[str, str]:
@@ -602,6 +645,15 @@ async def web_session(claims: dict[str, Any] = Depends(_require_web_session)):
     return {"valid": True, "expires_at": claims["exp"]}
 
 
+@app.get("/web/build")
+async def web_build():
+    """Expose only public source revisions; no session is required."""
+    return JSONResponse(
+        content=_public_build_manifest(),
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 @app.get("/web/capabilities")
 async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
     """Advertise optional browser features without exposing service topology."""
@@ -645,26 +697,41 @@ async def web_dlp_status(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_re
 
 
 @app.get("/web/dlp/jobs/{job_id}/file")
-async def web_dlp_file(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_require_web_session)):
+async def web_dlp_file(
+    job_id: uuid.UUID,
+    request: Request,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
     if forward_client is None:
         raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
     url, _token = _dlp_config()
     try:
-        upstream_request = forward_client.build_request(
-            "GET", f"{url}/v2/jobs/{job_id}/file", headers=_dlp_headers(claims)
-        )
+        headers = _dlp_headers(claims)
+        for name in ("range", "if-range"):
+            if value := request.headers.get(name):
+                headers[name] = value
+        upstream_request = forward_client.build_request("GET", f"{url}/v2/jobs/{job_id}/file", headers=headers)
         upstream = await forward_client.send(upstream_request, stream=True)
     except httpx.RequestError as exc:
         raise HTTPException(status_code=503, detail="Private download is temporarily unavailable") from exc
-    if upstream.status_code >= 400:
+    if upstream.status_code >= 400 and upstream.status_code != 416:
         await upstream.aclose()
         raise HTTPException(status_code=upstream.status_code, detail="Private download file is unavailable")
     headers = {
         name: value
         for name, value in upstream.headers.items()
-        if name.lower() in {"content-type", "content-length", "content-disposition"}
+        if name.lower() in {
+            "accept-ranges",
+            "content-range",
+            "content-type",
+            "content-length",
+            "content-disposition",
+            "etag",
+            "last-modified",
+        }
     }
     headers["Cache-Control"] = "no-store"
+    headers["X-Content-Type-Options"] = "nosniff"
     return StreamingResponse(
         upstream.aiter_raw(),
         status_code=upstream.status_code,

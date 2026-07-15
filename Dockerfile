@@ -1,5 +1,8 @@
 FROM python:3.13-slim
 
+ARG PINCHANA_BUILD_COMMIT=unknown
+ARG PINCHANA_BUILD_COMMITS={}
+
 WORKDIR /workspace/pinchana-server
 
 # Install Docker CLI so the server can manage sibling containers
@@ -28,6 +31,8 @@ COPY pinchana-server/src ./src
 RUN mkdir -p /app/cache
 ENV CACHE_PATH=/app/cache
 ENV CACHE_MAX_SIZE_GB=10.0
+ENV PINCHANA_BUILD_COMMIT=$PINCHANA_BUILD_COMMIT
+ENV PINCHANA_BUILD_COMMITS=$PINCHANA_BUILD_COMMITS
 
 EXPOSE 8080
 CMD ["uv", "run", "uvicorn", "pinchana_server.main:app", "--host", "0.0.0.0", "--port", "8080"]
