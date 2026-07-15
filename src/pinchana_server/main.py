@@ -448,6 +448,8 @@ def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
         return "unsupported_url", "No scraper supports this URL"
     if status_code == 400:
         return "invalid_url", raw_message
+    if status_code == 401 and "web session" in lowered:
+        return "unauthorized", "Invalid or missing web session"
     mapping = {
         401: ("unauthorized", "Invalid or missing API key"),
         403: ("forbidden", raw_message),

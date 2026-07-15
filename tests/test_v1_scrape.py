@@ -333,6 +333,7 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
+        self.assertEqual(response.json()["error"]["message"], "Invalid or missing web session")
 
     async def test_v1_auth_and_validation_use_error_envelopes(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []})
