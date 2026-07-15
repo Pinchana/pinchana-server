@@ -16,15 +16,23 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
 from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
 from pinchana_core.vpn import GluetunController, VpnRotationError
+
+from .media_probe import MediaDimensionProbe
+from .response_adapter import normalize_scrape_response
+from .schemas import ApiErrorResponse, ScrapeV1Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,6 +99,7 @@ storage = MediaStorage(
     base_path=os.getenv("CACHE_PATH", "./cache"),
     max_size_gb=float(os.getenv("CACHE_MAX_SIZE_GB", "10.0")),
 )
+dimension_probe = MediaDimensionProbe(storage.base_path)
 
 forward_client: httpx.AsyncClient | None = None
 internal_client: httpx.AsyncClient | None = None
@@ -414,6 +423,88 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Pinchana Server", version="1.0.0", lifespan=lifespan)
 
+
+def _is_v1_request(request: Request) -> bool:
+    return request.url.path.startswith("/v1/")
+
+
+def _error_message(detail: Any, fallback: str) -> str:
+    if isinstance(detail, dict):
+        nested = detail.get("detail")
+        return _error_message(nested, fallback) if nested is not None else fallback
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except json.JSONDecodeError:
+            return detail or fallback
+        return _error_message(parsed, fallback)
+    return fallback
+
+
+def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
+    raw_message = _error_message(detail, "Request failed")
+    lowered = raw_message.lower()
+    if status_code == 400 and "no module handles" in lowered:
+        return "unsupported_url", "No scraper supports this URL"
+    if status_code == 400:
+        return "invalid_url", raw_message
+    mapping = {
+        401: ("unauthorized", "Invalid or missing API key"),
+        403: ("forbidden", raw_message),
+        404: ("not_found", raw_message),
+        429: ("rate_limited", "The upstream service is rate limited"),
+        500: ("internal_error", "The scraper failed to process this URL"),
+        502: ("invalid_upstream_response", "The scraper returned an invalid response"),
+        503: ("service_unavailable", raw_message),
+    }
+    return mapping.get(status_code, ("http_error", raw_message))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def api_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    if not _is_v1_request(request):
+        return await http_exception_handler(request, exc)
+    code, message = _http_error_code(exc.status_code, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": code, "message": message, "details": None}},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def api_validation_exception_handler(request: Request, exc: RequestValidationError):
+    if not _is_v1_request(request):
+        return await request_validation_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": "validation_error",
+                "message": "Request validation failed",
+                "details": jsonable_encoder(exc.errors()),
+            }
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def api_unhandled_exception_handler(request: Request, exc: Exception):
+    if not _is_v1_request(request):
+        logger.exception("unhandled_request_error path=%s", request.url.path, exc_info=exc)
+        return PlainTextResponse(status_code=500, content="Internal Server Error")
+    logger.exception("v1_unhandled_request_error path=%s", request.url.path, exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "internal_error",
+                "message": "An internal error occurred",
+                "details": None,
+            }
+        },
+    )
+
 # Mount in-process plugin routers (if any)
 for name, plugin in registry.items():
     app.include_router(plugin.router, prefix=f"/{name}", tags=[name])
@@ -442,7 +533,7 @@ def _resolve_module(url: str):
     return None, None, None
 
 
-async def _forward_to_container(module_name: str, request: ScrapeRequest) -> ScrapeResponse:
+async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dict[str, Any]:
     module = container_registry.modules.get(module_name)
     if not module:
         raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
@@ -473,7 +564,11 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> Scr
             module_name, endpoint, resp.status_code, resp.text,
         )
         raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
-    return ScrapeResponse(**resp.json())
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        logger.error("Upstream module %s returned a non-object scrape payload", module_name)
+        raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
+    return payload
 
 
 def _rewrite_media_urls(value: Any, prefix: str) -> Any:
@@ -486,8 +581,11 @@ def _rewrite_media_urls(value: Any, prefix: str) -> Any:
     return value
 
 
-async def _process_scrape_request(request: ScrapeRequest, http_request: Request) -> ScrapeResponse:
-    """Route a validated scrape request to an in-process or container module."""
+async def _process_scrape_payload(
+    request: ScrapeRequest,
+    http_request: Request,
+) -> tuple[str, dict[str, Any]]:
+    """Route a scrape and retain the complete module payload for v1 adapters."""
     url = str(request.url)
     client = http_request.client
     client_address = f"{client.host}:{client.port}" if client else "unknown"
@@ -531,15 +629,24 @@ async def _process_scrape_request(request: ScrapeRequest, http_request: Request)
                 name, mode, resp.status_code, resp.text,
             )
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        result = ScrapeResponse(**resp.json())
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            logger.error("Upstream module %s returned a non-object scrape payload", name)
+            raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
     else:
-        result = await _forward_to_container(name, request)
+        payload = await _forward_to_container(name, request)
 
     logger.info(
         "scrape_complete module=%s mode=%s elapsed_ms=%.1f",
         name, mode, (time.perf_counter() - started) * 1000,
     )
-    return result
+    return name, payload
+
+
+async def _process_scrape_request(request: ScrapeRequest, http_request: Request) -> ScrapeResponse:
+    """Return the existing public response shape for legacy clients."""
+    _platform, payload = await _process_scrape_payload(request, http_request)
+    return ScrapeResponse(**payload)
 
 
 def _serve_media_file(post_id: str, filename: str) -> FileResponse:
@@ -599,6 +706,62 @@ async def process_scrape_request(
     """Machine-to-machine scrape endpoint protected by a named API key."""
     logger.info("authenticated_scrape client_name=%s", client_name)
     return await _process_scrape_request(request, http_request)
+
+
+@app.post(
+    "/v1/scrape",
+    response_model=ScrapeV1Response,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v1_scrape_request(
+    request: ScrapeRequest,
+    http_request: Request,
+    client_name: str = Depends(_require_api_key),
+):
+    """Return a versioned, normalized scrape response for machine clients."""
+    logger.info("authenticated_v1_scrape client_name=%s", client_name)
+    return await _normalized_scrape_response(request, http_request)
+
+
+async def _normalized_scrape_response(
+    request: ScrapeRequest,
+    http_request: Request,
+) -> ScrapeV1Response:
+    """Run a scrape through the shared public v1 response adapter."""
+    platform, payload = await _process_scrape_payload(request, http_request)
+    try:
+        return await normalize_scrape_response(
+            payload,
+            platform=platform,
+            source_url=str(request.url),
+            probe=dimension_probe,
+        )
+    except (ValueError, ValidationError) as exc:
+        logger.error("scrape_normalization_failed module=%s error=%s", platform, exc)
+        raise HTTPException(status_code=502, detail="The scraper returned an invalid response") from exc
+
+
+@app.post(
+    "/v1/web/scrape",
+    response_model=ScrapeV1Response,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v1_web_scrape_request(
+    request: ScrapeRequest,
+    http_request: Request,
+    _claims: dict[str, Any] = Depends(_require_web_session),
+):
+    """Return a normalized scrape response protected by a browser web session."""
+    logger.info("authenticated_v1_web_scrape")
+    result = await _normalized_scrape_response(request, http_request)
+    rewritten = _rewrite_media_urls(result.model_dump(), "/web/media")
+    return ScrapeV1Response.model_validate(rewritten)
 
 
 @app.post("/web/verify", response_model=WebSessionResponse)

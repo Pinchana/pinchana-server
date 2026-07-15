@@ -6,7 +6,7 @@
 
 ## ✨ Key Features
 
-- **🌐 Unified Entry Point:** Exposes a single `/scrape` endpoint for all supported platforms (TikTok, Instagram, etc.).
+- **🌐 Unified Entry Point:** Exposes legacy `/scrape` and normalized `/v1/scrape` endpoints for all supported platforms.
 - **🚦 Smart Routing:** Automatically directs requests to the correct module by matching URL patterns defined in `modules.yaml`.
 - **🛠 Module Management:** 
     - **Container Mode:** Can dynamically manage (start/stop) scraper containers via the Docker API.
@@ -38,12 +38,67 @@ Routes the URL to the appropriate scraper.
 ```
 Requires the `X-API-Key` header. Named keys are supplied through the `PINCHANA_API_KEYS` JSON environment variable.
 
+### `POST /v1/scrape`
+
+Returns the versioned API contract. It uses the same request body and `X-API-Key`
+authentication as `/scrape`, but groups source, content, author, and optional
+platform metadata. All downloadable assets are ordered in `data.media`:
+
+```json
+{
+  "data": {
+    "id": "SHORTCODE",
+    "source": {
+      "platform": "instagram",
+      "url": "https://www.instagram.com/p/SHORTCODE/",
+      "application": null
+    },
+    "content": {
+      "title": null,
+      "text": "Example reel",
+      "html": null,
+      "published_at": "2026-07-15T11:56:00Z"
+    },
+    "author": {"name": "creator", "username": "creator"},
+    "media": [
+      {
+        "index": 0,
+        "type": "video",
+        "role": "content",
+        "url": "/media/instagram/SHORTCODE/video.mp4",
+        "preview_url": "/media/instagram/SHORTCODE/thumbnail.jpg",
+        "dimensions": {"width": 1080, "height": 1920},
+        "duration_seconds": null,
+        "title": null,
+        "artist": null
+      }
+    ],
+    "music": null,
+    "engagement": null,
+    "safety": null,
+    "link": null
+  },
+  "meta": {"api_version": "1"}
+}
+```
+
+Visual media dimensions are measured from the cached file. If an image or video
+cannot be inspected, `dimensions` is `null`; audio always has null dimensions.
+Carousels are ordered content items, slideshow audio uses the `soundtrack` role,
+and album art uses the `cover` role. Threads music attachments are exposed as a
+30-second `soundtrack` preview with title, artist, and a separate `cover` asset.
+Errors have the stable shape
+`{"error":{"code":"...","message":"...","details":null}}`.
+
+`/scrape` remains available with its existing flat response for compatibility.
+
 ### Web routes
 
 - `POST /web/verify` validates a Turnstile token directly with Cloudflare Siteverify and returns a signed browser-session token.
 - `GET /web/identity` exposes the project-issued certificate used by the official web client to authorize a custom API origin.
 - `GET /web/session` validates that token.
 - `GET /web/build` publicly exposes the sanitized source revisions included in the deployment; it never returns configuration or infrastructure details.
+- `POST /v1/web/scrape` returns the same normalized v1 contract as `/v1/scrape`, authenticates with the browser-session bearer token, and places protected assets under `/web/media/...`.
 - `POST /web/scrape` performs a scrape with the browser-session bearer token.
 - `GET /web/media/...` serves protected media to a verified web session.
 - `GET /web/capabilities` advertises optional protocol-v2 DLP support.
