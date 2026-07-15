@@ -431,7 +431,10 @@ def _is_v1_request(request: Request) -> bool:
 def _error_message(detail: Any, fallback: str) -> str:
     if isinstance(detail, dict):
         nested = detail.get("detail")
-        return _error_message(nested, fallback) if nested is not None else fallback
+        if nested is not None:
+            return _error_message(nested, fallback)
+        message = detail.get("message")
+        return message if isinstance(message, str) and message else fallback
     if isinstance(detail, str):
         try:
             parsed = json.loads(detail)
@@ -441,8 +444,33 @@ def _error_message(detail: Any, fallback: str) -> str:
     return fallback
 
 
+def _upstream_error_code(detail: Any) -> str | None:
+    if isinstance(detail, dict):
+        nested = detail.get("detail")
+        if nested is not None:
+            return _upstream_error_code(nested)
+        code = detail.get("code")
+        return code if isinstance(code, str) and code else None
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except json.JSONDecodeError:
+            return None
+        return _upstream_error_code(parsed)
+    return None
+
+
 def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
     raw_message = _error_message(detail, "Request failed")
+    upstream_code = _upstream_error_code(detail)
+    if upstream_code in {
+        "authentication_required",
+        "restricted_media",
+        "not_found",
+        "rate_limited",
+        "extraction_failed",
+    }:
+        return upstream_code, raw_message
     lowered = raw_message.lower()
     if status_code == 400 and "no module handles" in lowered:
         return "unsupported_url", "No scraper supports this URL"

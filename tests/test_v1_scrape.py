@@ -13,6 +13,7 @@ from PIL import Image
 from starlette.requests import Request
 
 from pinchana_server.main import (
+    _http_error_code,
     _require_api_key,
     _require_web_session,
     api_http_exception_handler,
@@ -351,6 +352,33 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(invalid.json()["error"]["code"], "validation_error")
         self.assertIsInstance(invalid.json()["error"]["details"], list)
+
+    def test_structured_upstream_errors_keep_stable_codes_and_safe_messages(self):
+        tiktok = _http_error_code(
+            403,
+            '{"detail":{"code":"authentication_required","message":"This TikTok post requires login or audience confirmation"}}',
+        )
+        instagram = _http_error_code(
+            403,
+            {"code": "restricted_media", "message": "This Instagram post is not accessible anonymously"},
+        )
+        extraction = _http_error_code(
+            502,
+            {"detail": {"code": "extraction_failed", "message": "TikTok extraction failed"}},
+        )
+
+        self.assertEqual(
+            tiktok,
+            (
+                "authentication_required",
+                "This TikTok post requires login or audience confirmation",
+            ),
+        )
+        self.assertEqual(
+            instagram,
+            ("restricted_media", "This Instagram post is not accessible anonymously"),
+        )
+        self.assertEqual(extraction, ("extraction_failed", "TikTok extraction failed"))
 
     async def test_unsupported_url_error_does_not_expose_route_configuration(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []})
