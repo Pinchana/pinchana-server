@@ -71,6 +71,7 @@ class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
                         "media_type": "video",
                         "thumbnail_url": "",
                         "video_url": "/media/twitter/tweet-1/two.mp4",
+                        "looping": True,
                     },
                 ],
                 like_count=12,
@@ -91,6 +92,8 @@ class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.author.model_dump(), {"name": "Creator Name", "username": "creator"})
         self.assertEqual([item.type for item in data.media], ["image", "video"])
         self.assertEqual([item.index for item in data.media], [0, 1])
+        self.assertFalse(data.media[0].looping)
+        self.assertTrue(data.media[1].looping)
         self.assertEqual(data.media[0].dimensions.model_dump(), {"width": 1200, "height": 800})
         self.assertEqual(data.media[1].dimensions.model_dump(), {"width": 1080, "height": 1920})
         self.assertEqual(data.engagement.views, 99)

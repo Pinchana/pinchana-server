@@ -33,6 +33,7 @@ class MediaAsset(BaseModel):
     duration_seconds: int | None = Field(default=None, ge=0)
     title: str | None = None
     artist: str | None = None
+    looping: bool = False
 
 
 class ScrapeSource(BaseModel):

@@ -84,6 +84,7 @@ def _asset(
     duration: Any = None,
     title: Any = None,
     artist: Any = None,
+    looping: Any = False,
 ) -> dict[str, Any] | None:
     normalized_url = _text(url)
     if not normalized_url:
@@ -96,6 +97,7 @@ def _asset(
         "duration_seconds": _non_negative_int(duration),
         "title": _text(title),
         "artist": _text(artist),
+        "looping": bool(looping),
     }
 
 
@@ -127,6 +129,7 @@ def _media_descriptors(raw: dict[str, Any]) -> list[dict[str, Any]]:
                         role="content",
                         url=item.get("video_url"),
                         preview_url=item.get("thumbnail_url"),
+                        looping=item.get("looping"),
                     )
                 else:
                     descriptor = _asset(
@@ -143,6 +146,7 @@ def _media_descriptors(raw: dict[str, Any]) -> list[dict[str, Any]]:
                 url=raw.get("video_url"),
                 preview_url=raw.get("thumbnail_url"),
                 duration=raw.get("duration"),
+                looping=raw.get("looping"),
             )
             if descriptor:
                 descriptors.append(descriptor)
