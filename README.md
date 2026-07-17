@@ -99,6 +99,7 @@ This compatibility route uses the same authentication, request validation, routi
 - `POST /web/scrape` performs a scrape with the browser-session bearer token.
 - `GET /web/media/...` serves protected media to a verified web session.
 - `GET /web/capabilities` advertises optional protocol-v2 DLP support.
+- `POST /web/convert/gif` converts an authenticated, already-cached media file to GIF with bounded native FFmpeg limits; it never accepts uploads or remote URLs.
 - `/web/dlp/jobs...` allocates, submits, monitors, and streams owner-bound private-download jobs to the internal DLP service. The gateway forwards cookie ciphertext only.
 
 DLP is a separate asynchronous service, not a scraper module. It is disabled by default with `DLP_ENABLED=false`. When enabled, set independent `DLP_GATEWAY_TOKEN` and `DLP_OWNER_SECRET` values and keep `DLP_URL` reachable only on the internal gateway network.

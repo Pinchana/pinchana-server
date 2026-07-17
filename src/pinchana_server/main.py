@@ -1,5 +1,6 @@
 """Pinchana Server — dynamically loads plugins or manages containers."""
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -9,6 +10,8 @@ import logging
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +59,15 @@ FILENAME_STYLES = {"classic", "basic", "pretty", "nerdy"}
 BUILD_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 BUILD_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 BUILD_REPOSITORY_PATTERN = re.compile(r"^https://github\.com/Pinchana/[A-Za-z0-9_.-]+$")
+GIF_MAX_INPUT_BYTES = 50 * 1024 * 1024
+GIF_MAX_OUTPUT_BYTES = 50 * 1024 * 1024
+GIF_MAX_DURATION_SECONDS = 60.0
+GIF_PROCESS_TIMEOUT_SECONDS = 45.0
+GIF_FILTER = (
+    "fps=12,scale='min(960,iw)':-2:flags=lanczos,split[frames][palette_source];"
+    "[palette_source]palettegen=max_colors=128:stats_mode=diff[palette];"
+    "[frames][palette]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+)
 
 # ---------------------------------------------------------------------------
 # 1. In-process plugin discovery (optional — for local dev)
@@ -103,6 +115,9 @@ dimension_probe = MediaDimensionProbe(storage.base_path)
 
 forward_client: httpx.AsyncClient | None = None
 internal_client: httpx.AsyncClient | None = None
+gif_conversion_slots = asyncio.Semaphore(2)
+gif_conversion_sessions: set[str] = set()
+gif_conversion_sessions_lock = asyncio.Lock()
 
 
 class WebVerifyRequest(BaseModel):
@@ -112,6 +127,27 @@ class WebVerifyRequest(BaseModel):
 class WebSessionResponse(BaseModel):
     access_token: str
     expires_at: int
+
+
+class GifConversionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    platform: str = Field(min_length=1, max_length=32, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    postId: str = Field(min_length=1, max_length=256)
+    filename: str = Field(min_length=1, max_length=1024)
+
+    @field_validator("postId")
+    @classmethod
+    def safe_post_id(cls, value: str) -> str:
+        if value.startswith("/") or ".." in value or "/" in value or "\\" in value or "\x00" in value:
+            raise ValueError("invalid media path")
+        return value
+
+    @field_validator("filename")
+    @classmethod
+    def safe_filename(cls, value: str) -> str:
+        if value.startswith("/") or ".." in value or "\\" in value or "\x00" in value:
+            raise ValueError("invalid media path")
+        return value
 
 
 class DlpCookiesEnvelope(BaseModel):
@@ -679,7 +715,7 @@ async def _process_scrape_request(request: ScrapeRequest, http_request: Request)
     return ScrapeResponse(**payload)
 
 
-def _serve_media_file(post_id: str, filename: str) -> FileResponse:
+def _resolve_media_file(post_id: str, filename: str) -> Path:
     if ".." in filename or filename.startswith("/"):
         raise HTTPException(status_code=404, detail="Invalid path")
 
@@ -692,7 +728,67 @@ def _serve_media_file(post_id: str, filename: str) -> FileResponse:
 
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(resolved)
+    return resolved
+
+
+def _serve_media_file(post_id: str, filename: str) -> FileResponse:
+    return FileResponse(_resolve_media_file(post_id, filename))
+
+
+async def _run_media_process(*args: str, timeout: float) -> tuple[int, bytes, bytes]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="Media conversion is unavailable") from exc
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise HTTPException(status_code=504, detail="Media conversion timed out") from exc
+    return process.returncode or 0, stdout[-4096:], stderr[-4096:]
+
+
+async def _probe_media_duration(source: Path) -> float:
+    return_code, stdout, stderr = await _run_media_process(
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(source),
+        timeout=5.0,
+    )
+    if return_code != 0:
+        logger.info("gif_conversion_rejected reason=probe_failed stderr_bytes=%d", len(stderr))
+        raise HTTPException(status_code=422, detail="The media file cannot be converted")
+    try:
+        duration = float(stdout.strip())
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=422, detail="The media duration is unavailable") from exc
+    if not 0 < duration <= GIF_MAX_DURATION_SECONDS:
+        raise HTTPException(status_code=422, detail="GIF conversion supports media up to 60 seconds")
+    return duration
+
+
+async def _convert_media_to_gif(source: Path, output: Path) -> None:
+    return_code, _stdout, stderr = await _run_media_process(
+        "ffmpeg",
+        "-nostdin", "-y", "-loglevel", "error",
+        "-i", str(source),
+        "-filter_complex", GIF_FILTER,
+        "-loop", "0",
+        "-fs", str(GIF_MAX_OUTPUT_BYTES),
+        str(output),
+        timeout=GIF_PROCESS_TIMEOUT_SECONDS,
+    )
+    if return_code != 0:
+        logger.info("gif_conversion_failed reason=ffmpeg_exit stderr_bytes=%d", len(stderr))
+        raise HTTPException(status_code=422, detail="The media file cannot be converted to GIF")
 
 
 # ---------------------------------------------------------------------------
@@ -866,8 +962,81 @@ async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_sessio
             "filenameStyles": capabilities["filenameStyles"] if capabilities else [],
             "subtitleLanguages": capabilities["subtitleLanguages"] if capabilities else [],
             "betterAudio": capabilities["betterAudio"] if capabilities else False,
-        }
+        },
+        "mediaConversions": {
+            "gif": {"serverFallback": True},
+        },
     }
+
+
+async def _acquire_gif_conversion(claims: dict[str, Any]) -> str:
+    owner = claims.get("nonce")
+    if not isinstance(owner, str) or not owner:
+        raise HTTPException(status_code=401, detail="Invalid web session")
+    async with gif_conversion_sessions_lock:
+        if owner in gif_conversion_sessions:
+            raise HTTPException(status_code=429, detail="A GIF conversion is already running for this session")
+        if gif_conversion_slots.locked():
+            raise HTTPException(status_code=429, detail="GIF conversion is busy; try again shortly")
+        await gif_conversion_slots.acquire()
+        gif_conversion_sessions.add(owner)
+    return owner
+
+
+async def _release_gif_conversion(owner: str) -> None:
+    async with gif_conversion_sessions_lock:
+        gif_conversion_sessions.discard(owner)
+        gif_conversion_slots.release()
+
+
+@app.post("/web/convert/gif")
+async def web_convert_gif(
+    request: GifConversionRequest,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    source = _resolve_media_file(request.postId, request.filename)
+    source_size = source.stat().st_size
+    if source_size <= 0 or source_size > GIF_MAX_INPUT_BYTES:
+        logger.info("gif_conversion_rejected reason=input_size bytes=%d", source_size)
+        raise HTTPException(status_code=413, detail="GIF conversion supports files up to 50 MiB")
+
+    owner = await _acquire_gif_conversion(claims)
+    temporary_directory: Path | None = None
+    started = time.perf_counter()
+    try:
+        duration = await _probe_media_duration(source)
+        temporary_directory = Path(tempfile.mkdtemp(prefix="pinchana-gif-"))
+        output = temporary_directory / "output.gif"
+        await _convert_media_to_gif(source, output)
+        if not output.is_file() or output.stat().st_size <= 0:
+            raise HTTPException(status_code=422, detail="GIF conversion produced an empty file")
+        if output.stat().st_size > GIF_MAX_OUTPUT_BYTES:
+            raise HTTPException(status_code=413, detail="The converted GIF exceeds 50 MiB")
+
+        output_name = f"{source.stem}.gif"
+        logger.info(
+            "gif_conversion_complete input_bytes=%d output_bytes=%d duration_seconds=%.3f elapsed_ms=%.1f",
+            source_size,
+            output.stat().st_size,
+            duration,
+            (time.perf_counter() - started) * 1000,
+        )
+        cleanup = temporary_directory
+        temporary_directory = None
+        return FileResponse(
+            output,
+            media_type="image/gif",
+            filename=output_name,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+            background=BackgroundTask(shutil.rmtree, cleanup, ignore_errors=True),
+        )
+    finally:
+        if temporary_directory is not None:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
+        await _release_gif_conversion(owner)
 
 
 @app.post("/web/dlp/jobs")
