@@ -1,47 +1,41 @@
-# 🚀 Pinchana Server
+# Pinchana Server
 
-**Pinchana Server** is the central gateway for the Pinchana scraping ecosystem. It acts as a unified HTTP entry point, routing incoming requests to specialized scraper modules based on URL patterns.
-
----
-
-## ✨ Key Features
-
-- **🌐 Unified Entry Point:** Exposes legacy `/scrape` and normalized `/v1/scrape` endpoints for all supported platforms.
-- **🚦 Smart Routing:** Automatically directs requests to the correct module by matching URL patterns defined in `modules.yaml`.
-- **🛠 Module Management:** 
-    - **Container Mode:** Can dynamically manage (start/stop) scraper containers via the Docker API.
-    - **Proxying:** transparently forwards requests to standalone containerized modules over HTTP.
-- **🛡 VPN Integration:** Provides admin endpoints to monitor and rotate the global VPN IP (Gluetun).
-- **💾 Media Serving:** Directly serves cached media files stored by the scrapers.
+Pinchana Server is the central HTTP gateway for Pinchana. It authenticates clients, selects a platform module from configured URL patterns, normalizes API v1 responses, serves protected cached media, and exposes the isolated browser-session flow.
 
 ---
 
-## 🏗 How it Works
+## Responsibilities
 
-1. **Request Received:** A client sends a `POST /scrape` request with a URL.
-2. **Resolution:** The server checks `modules.yaml` to find a module that matches the URL pattern.
-3. **Execution:** 
-    - If the module is "in-process", it calls the plugin directly.
-    - If the module is a "container", it proxies the request to the module's HTTP endpoint.
-4. **Response:** The server returns the standardized metadata to the client.
+- Exposes normalized `/v1/scrape` and legacy `/scrape` routes for supported platforms.
+- Selects the appropriate module by matching patterns in `modules.yaml`.
+- Proxies requests to containerized modules or calls registered in-process plugins.
+- Provides authenticated administration routes for Gluetun status and rotation.
+- Serves files from the shared media cache with authentication and range support.
+- Optionally manages module containers when `CONTAINER_MODE=true` and the Docker socket is mounted.
 
 ---
 
-## 📡 API Reference
+## Request flow
 
-### `POST /scrape`
-Routes the URL to the appropriate scraper.
+1. A machine client sends `POST /v1/scrape` with a complete HTTP(S) URL and `X-API-Key`.
+2. The server validates the request and selects the first matching module from `modules.yaml`.
+3. It calls an in-process plugin or forwards the request to the configured module endpoint.
+4. It converts the module result to the stable v1 `{data, meta}` envelope.
+5. The client retrieves protected `/media/...` paths with the same machine key.
+
+---
+
+## API reference
+
+### `POST /v1/scrape`
+
+Routes the URL to the appropriate scraper and returns the versioned contract.
 ```json
 {
   "url": "https://www.tiktok.com/..."
 }
 ```
-Requires the `X-API-Key` header. Named keys are supplied through the `PINCHANA_API_KEYS` JSON environment variable.
-
-### `POST /v1/scrape`
-
-Returns the versioned API contract. It uses the same request body and `X-API-Key`
-authentication as `/scrape`, but groups source, content, author, and optional
+This route requires the `X-API-Key` header. Named keys are supplied through the `PINCHANA_API_KEYS` JSON environment variable. The response groups source, content, author, and optional
 platform metadata. All downloadable assets are ordered in `data.media`:
 
 ```json
@@ -70,7 +64,8 @@ platform metadata. All downloadable assets are ordered in `data.media`:
         "dimensions": {"width": 1080, "height": 1920},
         "duration_seconds": null,
         "title": null,
-        "artist": null
+        "artist": null,
+        "looping": false
       }
     ],
     "music": null,
@@ -90,7 +85,9 @@ and album art uses the `cover` role. Threads music attachments are exposed as a
 Errors have the stable shape
 `{"error":{"code":"...","message":"...","details":null}}`.
 
-`/scrape` remains available with its existing flat response for compatibility.
+### `POST /scrape`
+
+This compatibility route uses the same authentication, request validation, routing, and forwarding limits but returns the earlier flat response. New clients must use `/v1/scrape`.
 
 ### Web routes
 
@@ -117,7 +114,7 @@ Returns a list of all configured modules and their status.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -133,17 +130,17 @@ See [Instance certificates](../docs/INSTANCE_TRUST.md) for issuance and security
 
 ---
 
-## 🛠 Development
+## Development
 
 Managed by `uv`.
 
 ```bash
-uv sync
-uv run uvicorn src.pinchana_server.main:app --host 0.0.0.0 --port 8080
+uv sync --frozen
+uv run uvicorn pinchana_server.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 ---
 
-## 📜 License
+## License
 
 MIT
