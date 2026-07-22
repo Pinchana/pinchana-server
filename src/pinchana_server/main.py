@@ -63,6 +63,7 @@ from .schemas import (
     ScrapeV2WebProcessingResponse,
     ScrapeV2WebReadyResponse,
     ScrapeV2Content,
+    WebCollectionItemV2,
     WebAssetTunnelDelivery,
     WebAssetV2,
 )
@@ -79,10 +80,43 @@ V2_PLATFORM_FLAGS = {
     "tiktok": ("PINCHANA_V2_TIKTOK", False),
     "threads": ("PINCHANA_V2_THREADS", False),
     "twitter": ("PINCHANA_V2_TWITTER", False),
+    "soundcloud": ("PINCHANA_V2_SOUNDCLOUD", False),
+    "spotify": ("PINCHANA_V2_SPOTIFY", False),
+    "deezer": ("PINCHANA_V2_DEEZER", False),
+    "ytmusic": ("PINCHANA_V2_YTMUSIC", False),
 }
 V2_TICKET_TTL_SECONDS = 7200
 V2_UPSTREAM_SAFETY_MARGIN_SECONDS = 60
 V2_MIN_DIRECT_TTL_SECONDS = 60
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def _max_collection_items() -> int:
+    return _bounded_env_int("PINCHANA_V2_MAX_COLLECTION_ITEMS", 100, 1, 500)
+
+
+def _max_initial_tickets() -> int:
+    return _bounded_env_int("PINCHANA_V2_MAX_INITIAL_TICKETS", 32, 1, 100)
+
+
+def _max_archive_items() -> int:
+    return _bounded_env_int("PINCHANA_V2_MAX_ARCHIVE_ITEMS", 32, 1, 100)
+
+
+def _max_direct_audio_bytes() -> int:
+    return _bounded_env_int(
+        "PINCHANA_V2_MAX_DIRECT_AUDIO_BYTES",
+        512 * 1024 * 1024,
+        1024 * 1024,
+        2 * 1024 * 1024 * 1024,
+    )
 
 TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 TURNSTILE_TEST_SECRET_KEYS = {
@@ -714,6 +748,12 @@ def _descriptor_ticket_ttl(descriptor: RemoteAssetDescriptor) -> int:
 def _descriptor_can_tunnel(descriptor: RemoteAssetDescriptor) -> bool:
     if not descriptor.supports_range:
         return False
+    if (
+        descriptor.media_type == "audio"
+        and descriptor.size is not None
+        and descriptor.size > _max_direct_audio_bytes()
+    ):
+        return False
     if descriptor.credential_ref:
         return _descriptor_ticket_ttl(descriptor) >= V2_MIN_DIRECT_TTL_SECONDS
     return _descriptor_ticket_ttl(descriptor) >= V2_MIN_DIRECT_TTL_SECONDS
@@ -1020,6 +1060,66 @@ def _get_instance_id(claims: dict[str, Any]) -> str:
 async def _stream_credential_asset(ticket: TicketData, request: Request):
     reference = ticket.descriptor.credential_ref or ""
     module_name = reference.split(".", 1)[0]
+    if module_name == "dlp":
+        dlp_job_id = reference.partition(".")[2]
+        try:
+            uuid.UUID(dlp_job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Invalid processing asset reference") from exc
+        if forward_client is None:
+            raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+        dlp_url, _token = _dlp_config()
+        headers = _dlp_headers({"nonce": ticket.session_nonce})
+        for name in ("range", "if-range"):
+            if value := request.headers.get(name):
+                headers[name] = value
+        try:
+            response = await forward_client.send(
+                forward_client.build_request(
+                    request.method,
+                    f"{dlp_url}/v2/jobs/{dlp_job_id}/file",
+                    headers=headers,
+                ),
+                stream=True,
+            )
+        except httpx.RequestError as exc:
+            v2_observability.increment("credential_resolution_failure", platform="ytmusic")
+            raise HTTPException(status_code=503, detail="Processed audio is temporarily unavailable") from exc
+        if response.status_code >= 400 and response.status_code != 416:
+            await response.aclose()
+            v2_observability.increment("credential_resolution_failure", platform="ytmusic")
+            raise HTTPException(status_code=502, detail="Processed audio delivery failed")
+        output_headers = {
+            name: value
+            for name in (
+                "accept-ranges", "content-length", "content-range", "content-type",
+                "etag", "last-modified",
+            )
+            if (value := response.headers.get(name))
+        }
+        output_headers["Cache-Control"] = "private, no-store"
+        output_headers["X-Content-Type-Options"] = "nosniff"
+        delivered_filename = normalized_filename(
+            ticket.descriptor.filename, response.headers.get("content-type")
+        )
+        output_headers["Content-Disposition"] = f'attachment; filename="{delivered_filename}"'
+        v2_observability.increment(f"upstream_{response.status_code}", platform="ytmusic")
+        if request.method == "HEAD":
+            await response.aclose()
+            return Response(status_code=response.status_code, headers=output_headers)
+
+        async def dlp_body():
+            try:
+                async for chunk in response.aiter_raw():
+                    yield chunk
+            finally:
+                await response.aclose()
+                await ticket_store.release_lease(ticket.ticket_id)
+
+        return StreamingResponse(
+            dlp_body(), status_code=response.status_code, headers=output_headers
+        )
+
     plugin = registry.get(module_name)
     module = container_registry.modules.get(module_name)
     if plugin is not None:
@@ -1350,6 +1450,10 @@ async def _recover_ephemeral_jobs() -> set[Path]:
                 await _delete_ephemeral_job(job_id)
                 v2_observability.increment("processing_job_expiry", platform=job.get("platform"))
             continue
+        if job.get("kind") == "dlp":
+            # The established DLP service owns recovery and output storage;
+            # Redis-backed owner binding lets this gateway resume polling.
+            continue
         if status == "processing":
             await _cleanup_job_spool(job)
             job.update({
@@ -1557,6 +1661,7 @@ async def _run_ephemeral_spool_job(
                     index=descriptor.index,
                     type=descriptor.media_type,
                     role=descriptor.role,
+                    availability=descriptor.availability,
                     filename=resolved_descriptor.filename,
                     mime_type=resolved_descriptor.mime_type,
                     size=descriptor.size,
@@ -1576,13 +1681,10 @@ async def _run_ephemeral_spool_job(
             status="ready",
             request_id=job_id,
             source=ScrapeSource(platform=module_name, url=url),
-            content=ScrapeV2Content(
-                shortcode=extracted.shortcode,
-                title=extracted.caption,
-                text=extracted.caption,
-            ),
+            content=_v2_content(extracted),
             author=ScrapeAuthor(name=extracted.author, username=extracted.author),
             assets=web_assets,
+            collection=_web_collection_items(extracted),
         )
         ready_expiry = int(time.time()) + 1800
         await _set_ephemeral_job(job_id, {
@@ -1650,6 +1752,107 @@ async def _run_ephemeral_spool_job_guarded(
         v2_observability.increment("processing_job_failure", platform=module_name)
 
 
+async def _get_v2_dlp_job_status(
+    public_job_id: str,
+    job: dict[str, Any],
+    claims: dict[str, Any],
+):
+    platform = str(job.get("platform") or "ytmusic")
+    dlp_job_id = str(job.get("dlp_job_id") or "")
+    status = await _dlp_json("GET", f"/v2/jobs/{dlp_job_id}", claims)
+    state = str(status.get("status") or "").upper()
+    if status.get("expiresAt"):
+        job["expires_at"] = min(int(job["expires_at"]), int(status["expiresAt"]))
+    if state == "READY":
+        ticket_ids = list(job.get("ticket_ids") or [])
+        ticket = await ticket_store.get_ticket(ticket_ids[0]) if ticket_ids else None
+        if ticket is None:
+            descriptor = RemoteAssetDescriptor(
+                index=0,
+                media_type="audio",
+                role="content",
+                availability="full",
+                filename=str(job.get("filename") or f"{job['shortcode']}.mp3"),
+                mime_type=status.get("mime"),
+                credential_ref=f"dlp.{dlp_job_id}",
+                size=status.get("size"),
+                duration_seconds=job.get("duration_seconds"),
+                supports_range=True,
+                expires_at=int(job["expires_at"]),
+                asset_id=str(job["asset_id"]),
+                source_fingerprint=str(job["source_fingerprint"]),
+            )
+            ttl = _descriptor_ticket_ttl(descriptor)
+            ticket = await ticket_store.create_ticket(
+                session_nonce=str(job["session_nonce"]),
+                instance_id=str(job["instance_id"]),
+                descriptor=descriptor,
+                ttl_seconds=ttl,
+            )
+            job["ticket_ids"] = [ticket.ticket_id]
+            job["status"] = "ready"
+            await _set_ephemeral_job(public_job_id, job)
+            v2_observability.increment("processing_job_success", platform=platform)
+            v2_observability.observe(
+                "time_to_ready",
+                max(0.0, time.time() - float(job.get("created_at") or time.time())),
+                platform=platform,
+            )
+        return ScrapeV2WebReadyResponse(
+            status="ready",
+            request_id=public_job_id,
+            source=ScrapeSource(platform=platform, url=str(job["submitted_url"])),  # type: ignore[arg-type]
+            content=ScrapeV2Content(
+                shortcode=str(job["shortcode"]),
+                title=job.get("caption"),
+                text=job.get("caption"),
+                album=job.get("album"),
+                duration_seconds=job.get("duration_seconds"),
+                availability=job.get("availability", "full"),
+                classifications=list(job.get("classifications") or []),
+                item_count=0,
+            ),
+            author=ScrapeAuthor(name=job.get("author"), username=job.get("author")),
+            assets=[WebAssetV2(
+                id=f"{job['shortcode']}-0",
+                asset_key=str(job["asset_id"]),
+                index=0,
+                type="audio",
+                role="content",
+                availability="full",
+                filename=ticket.descriptor.filename,
+                mime_type=status.get("mime"),
+                size=status.get("size"),
+                duration_seconds=job.get("duration_seconds"),
+                delivery=WebAssetTunnelDelivery(
+                    kind="tunnel",
+                    url=f"/v2/assets/{ticket.ticket_id}",
+                    expires_at=ticket.expires_at,
+                ),
+            )],
+            collection=[],
+        )
+    if state in {"FAILED", "CANCELLED"}:
+        job["status"] = "failed"
+        job["error"] = "Audio processing failed"
+        await _set_ephemeral_job(public_job_id, job)
+        v2_observability.increment("processing_job_failure", platform=platform)
+        raise HTTPException(status_code=502, detail=job["error"])
+    if state == "EXPIRED":
+        await _delete_ephemeral_job(public_job_id)
+        v2_observability.increment("processing_job_expiry", platform=platform)
+        raise HTTPException(status_code=410, detail="Job expired")
+    progress = status.get("progress")
+    return {
+        "status": "processing",
+        "job_id": public_job_id,
+        "status_url": f"/v2/jobs/{public_job_id}",
+        "expires_at": int(job["expires_at"]),
+        "retry_after": 2,
+        "progress": progress if isinstance(progress, (int, float)) else None,
+    }
+
+
 @app.get("/v2/jobs/{job_id}")
 async def get_v2_job_status(
     job_id: str,
@@ -1672,6 +1875,8 @@ async def get_v2_job_status(
     ):
         v2_observability.increment("processing_job_403", platform=job.get("platform"))
         raise HTTPException(status_code=403, detail="Job does not belong to this web session")
+    if job.get("kind") == "dlp":
+        return await _get_v2_dlp_job_status(job_id, job, claims)
     if job["status"] == "ready":
         if not _job_spool_files_available(job):
             await _cleanup_job_spool(job)
@@ -1697,6 +1902,131 @@ async def get_v2_job_status(
     }
 
 
+def _collection_size_bucket(size: int) -> str:
+    if size == 0:
+        return "0"
+    if size <= 10:
+        return "1_10"
+    if size <= 50:
+        return "11_50"
+    if size <= 100:
+        return "51_100"
+    return "101_plus"
+
+
+def _web_collection_items(extracted: ScrapeV2ExtractedData) -> list[WebCollectionItemV2]:
+    result: list[WebCollectionItemV2] = []
+    for item in sorted(extracted.collection, key=lambda value: value.index):
+        if item.processing:
+            delivery_status = "processing-required"
+        elif item.assets:
+            delivery_status = "select-item"
+        else:
+            delivery_status = "unavailable"
+        result.append(WebCollectionItemV2(
+            index=item.index,
+            item_id=item.item_id,
+            title=item.title,
+            artist=item.artist,
+            album=item.album,
+            duration_seconds=item.duration_seconds,
+            availability=item.availability,
+            classifications=list(item.classifications),
+            asset_count=len(item.assets),
+            delivery_status=delivery_status,
+        ))
+    return result
+
+
+def _v2_content(extracted: ScrapeV2ExtractedData) -> ScrapeV2Content:
+    return ScrapeV2Content(
+        shortcode=extracted.shortcode,
+        title=extracted.caption,
+        text=extracted.caption,
+        album=extracted.album,
+        duration_seconds=extracted.duration_seconds,
+        availability=extracted.availability,
+        classifications=list(extracted.classifications),
+        item_count=extracted.collection_total or len(extracted.collection),
+        resolved_item_count=len(extracted.collection),
+        collection_truncated=extracted.collection_truncated,
+    )
+
+
+async def _start_v2_dlp_job(
+    *,
+    extracted: ScrapeV2ExtractedData,
+    submitted_url: str,
+    platform: str,
+    claims: dict[str, Any],
+    instance_id: str,
+) -> ScrapeV2WebProcessingResponse:
+    directive = extracted.processing
+    if directive is None or directive.kind != "dlp":
+        raise HTTPException(status_code=502, detail="Invalid processing directive")
+    if not _dlp_enabled() or await _dlp_capabilities() is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "dlp_unavailable", "message": "Audio processing is unavailable"},
+        )
+    allocation = await _dlp_json("POST", "/v2/jobs", claims)
+    dlp_job_id = str(allocation.get("jobId") or "")
+    try:
+        uuid.UUID(dlp_job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Audio processing allocation failed") from exc
+    allowed_options = {
+        "quality", "codec", "container", "audioFormat", "audioBitrate",
+        "preferBetterAudio", "dubLanguage", "filenameStyle", "subtitleLanguage",
+    }
+    submitted = {
+        key: value
+        for key, value in directive.options.items()
+        if key in allowed_options
+    }
+    submitted["url"] = str(directive.source_url)
+    await _dlp_json("POST", f"/v2/jobs/{dlp_job_id}/submit", claims, submitted)
+    now = int(time.time())
+    expires_at = now + _bounded_env_int("DLP_JOB_TTL_SECONDS", 7200, 300, 86_400)
+    public_job_id = secrets.token_urlsafe(18)
+    await _set_ephemeral_job(public_job_id, {
+        "kind": "dlp",
+        "status": "processing",
+        "created_at": now,
+        "expires_at": expires_at,
+        "session_nonce": claims.get("nonce", ""),
+        "instance_id": instance_id,
+        "platform": platform,
+        "dlp_job_id": dlp_job_id,
+        "submitted_url": submitted_url,
+        "shortcode": extracted.shortcode,
+        "caption": extracted.caption,
+        "author": extracted.author,
+        "album": extracted.album,
+        "duration_seconds": extracted.duration_seconds,
+        "availability": extracted.availability,
+        "classifications": list(extracted.classifications),
+        "asset_id": str(directive.options.get("asset_id") or f"{platform}:{extracted.shortcode}:full"),
+        "source_fingerprint": str(
+            directive.options.get("source_fingerprint")
+            or hashlib.sha256(f"{platform}:{extracted.shortcode}:full".encode()).hexdigest()
+        ),
+        "filename": str(directive.options.get("filename") or f"{extracted.shortcode}.mp3"),
+        "spool_dir": None,
+        "spool_files": [],
+        "ticket_ids": [],
+    })
+    v2_observability.increment("delivery_dlp", platform=platform)
+    return ScrapeV2WebProcessingResponse(
+        status="processing",
+        request_id=str(uuid.uuid4()),
+        job_id=public_job_id,
+        status_url=f"/v2/jobs/{public_job_id}",
+        expires_at=expires_at,
+        retry_after=2,
+    )
+
+
 @app.post(
     "/v2/scrape",
     response_model=ScrapeV2WebReadyResponse | ScrapeV2WebProcessingResponse,
@@ -1706,7 +2036,7 @@ async def get_v2_job_status(
     },
 )
 async def process_v2_web_scrape(
-    request: ScrapeRequest,
+    request: ScrapeV2Context,
     http_request: Request,
     claims: dict[str, Any] = Depends(_require_web_session),
 ):
@@ -1751,11 +2081,16 @@ async def process_v2_web_scrape(
             detail={"code": "v2_capability_unavailable", "message": f"Native v2 is unavailable for {name}"},
         )
     try:
-        scrape_resp = await module_client.post(f"{module_base}/v2/scrape", json={"url": url})
+        scrape_resp = await module_client.post(
+            f"{module_base}/v2/scrape",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
     except httpx.HTTPError as exc:
         logger.warning("v2_extract_unreachable platform=%s error=%s", name, type(exc).__name__)
+        v2_observability.increment("extraction_failure", platform=str(name))
         raise HTTPException(status_code=503, detail={"code": "service_unavailable", "message": f"The {name} scraper is unavailable"}) from exc
     if scrape_resp.status_code != 200:
+        v2_observability.increment("extraction_failure", platform=str(name))
         try:
             upstream_detail = scrape_resp.json().get("detail")
         except (ValueError, AttributeError):
@@ -1767,9 +2102,56 @@ async def process_v2_web_scrape(
     try:
         v2_extracted = ScrapeV2ExtractedData(**scrape_resp.json())
     except (ValueError, ValidationError) as exc:
+        v2_observability.increment("extraction_failure", platform=str(name))
         raise HTTPException(status_code=502, detail={"code": "invalid_response", "message": "The scraper returned an invalid v2 response"}) from exc
+    if len(v2_extracted.collection) > _max_collection_items():
+        raise HTTPException(
+            status_code=413,
+            detail={"code": "collection_too_large", "message": "Collection exceeds the configured metadata limit"},
+        )
+    if len(v2_extracted.assets) > min(_max_initial_tickets(), _max_archive_items()):
+        raise HTTPException(
+            status_code=413,
+            detail={"code": "too_many_assets", "message": "Result exceeds the initial ticket limit"},
+        )
+    availability_metric = v2_extracted.availability.replace("-", "_")
+    v2_observability.increment(f"result_{availability_metric}", platform=str(name))
+    if v2_extracted.collection:
+        v2_observability.increment(
+            f"collection_size_{_collection_size_bucket(len(v2_extracted.collection))}",
+            platform=str(name),
+        )
+
+    if v2_extracted.processing is not None:
+        response = await _start_v2_dlp_job(
+            extracted=v2_extracted,
+            submitted_url=url,
+            platform=str(name),
+            claims=claims,
+            instance_id=instance_id,
+        )
+        v2_observability.increment("native_v2_success", platform=str(name))
+        v2_observability.observe(
+            "resolve_latency", time.monotonic() - resolve_started, platform=str(name)
+        )
+        return response
+
     if not v2_extracted.assets:
-        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "No downloadable media found"})
+        v2_observability.increment("native_v2_success", platform=str(name))
+        v2_observability.observe(
+            "resolve_latency", time.monotonic() - resolve_started, platform=str(name)
+        )
+        if v2_extracted.availability == "metadata-only":
+            v2_observability.increment("metadata_only_result", platform=str(name))
+        return ScrapeV2WebReadyResponse(
+            status="ready",
+            request_id=str(uuid.uuid4()),
+            source=ScrapeSource(platform=name, url=url),  # type: ignore[arg-type]
+            content=_v2_content(v2_extracted),
+            author=ScrapeAuthor(name=v2_extracted.author, username=v2_extracted.author),
+            assets=[],
+            collection=_web_collection_items(v2_extracted),
+        )
 
     if any(not _descriptor_can_tunnel(descriptor) for descriptor in v2_extracted.assets):
         job_id = secrets.token_urlsafe(18)
@@ -1823,6 +2205,7 @@ async def process_v2_web_scrape(
                 index=desc.index,
                 type=desc.media_type,  # type: ignore
                 role=desc.role,  # type: ignore
+                availability=desc.availability,
                 filename=desc.filename,
                 mime_type=desc.mime_type,
                 size=desc.size,
@@ -1847,13 +2230,10 @@ async def process_v2_web_scrape(
         status="ready",
         request_id=str(uuid.uuid4()),
         source=ScrapeSource(platform=name, url=url),  # type: ignore[arg-type]
-        content=ScrapeV2Content(
-            shortcode=v2_extracted.shortcode,
-            title=v2_extracted.caption,
-            text=v2_extracted.caption,
-        ),
+        content=_v2_content(v2_extracted),
         author=ScrapeAuthor(name=v2_extracted.author, username=v2_extracted.author),
         assets=web_assets,
+        collection=_web_collection_items(v2_extracted),
     )
 
 
@@ -1905,6 +2285,318 @@ async def serve_v2_asset(
         raise
 
 
+async def _extract_v2_for_telegram(
+    request: ScrapeRequest,
+    *,
+    platform: str,
+    mode: str,
+    target: Any,
+) -> ScrapeV2ExtractedData:
+    if internal_client is None or forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    module_client = internal_client if mode == "in_process" else forward_client
+    module_base = f"/{platform}" if mode == "in_process" else target.endpoint.rstrip("/")
+    try:
+        capabilities = await module_client.get(f"{module_base}/v2/capabilities", timeout=5)
+        capability_payload = capabilities.json() if capabilities.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Native audio capability is unavailable") from exc
+    if not capability_payload.get("supports_v2_remote"):
+        raise HTTPException(status_code=502, detail="Native audio capability is unavailable")
+    response = await module_client.post(
+        f"{module_base}/v2/scrape",
+        json=ScrapeV2Context(url=request.url, platform=platform).model_dump(mode="json"),
+    )
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Native audio extraction failed")
+    try:
+        return ScrapeV2ExtractedData.model_validate(response.json())
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=502, detail="Native audio response is invalid") from exc
+
+
+async def _open_telegram_descriptor(
+    descriptor: RemoteAssetDescriptor,
+    platform: str,
+):
+    if descriptor.credential_ref:
+        reference = descriptor.credential_ref
+        namespace = reference.split(".", 1)[0]
+        plugin = registry.get(namespace)
+        module = container_registry.modules.get(namespace)
+        if plugin is not None:
+            client, base = internal_client, f"/{namespace}"
+        elif module is not None:
+            client, base = forward_client, module.endpoint.rstrip("/")
+        else:
+            raise HTTPException(status_code=502, detail="Audio credential resolver is unavailable")
+        if client is None:
+            raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+        response = await client.send(
+            client.build_request(
+                "GET",
+                f"{base}/v2/internal/assets/{urllib.parse.quote(reference, safe='._-')}",
+                headers={"X-Pinchana-Internal-Token": os.getenv("PINCHANA_INTERNAL_TOKEN", "pinchana-local-development")},
+            ),
+            stream=True,
+        )
+        return response, None
+
+    current_url = descriptor.upstream_url
+    if not current_url:
+        raise HTTPException(status_code=502, detail="Audio asset has no delivery source")
+    headers = {
+        key: str(value)
+        for key, value in (descriptor.safe_headers or {}).items()
+        if key.lower() in {"user-agent", "referer", "accept", "accept-language"}
+    }
+    for _hop in range(5):
+        try:
+            current_url, resolved_ip = validate_upstream_url(current_url)
+        except HTTPException:
+            v2_observability.increment("ssrf_rejection", platform=platform)
+            raise
+        hostname = urllib.parse.urlparse(current_url).hostname
+        if not hostname:
+            raise HTTPException(status_code=502, detail="Audio upstream is invalid")
+        client = httpx.AsyncClient(
+            transport=pinned_httpx_transport(hostname, resolved_ip),
+            timeout=httpx.Timeout(120, connect=10),
+        )
+        response = await client.send(
+            client.build_request("GET", current_url, headers=headers), stream=True
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response, client
+        location = response.headers.get("location")
+        await response.aclose()
+        await client.aclose()
+        if not location:
+            raise HTTPException(status_code=502, detail="Audio upstream redirect is invalid")
+        next_url = urllib.parse.urljoin(current_url, location)
+        if urllib.parse.urlparse(next_url).netloc != urllib.parse.urlparse(current_url).netloc:
+            headers.pop("Referer", None)
+            headers.pop("referer", None)
+        current_url = next_url
+    raise HTTPException(status_code=502, detail="Audio upstream redirected too many times")
+
+
+async def _telegram_dlp_descriptor(
+    extracted: ScrapeV2ExtractedData,
+    *,
+    client_name: str,
+) -> tuple[RemoteAssetDescriptor, Any, Any]:
+    directive = extracted.processing
+    if directive is None:
+        raise HTTPException(status_code=502, detail="Audio processing directive is missing")
+    claims = {"nonce": f"telegram:{client_name}"}
+    if not _dlp_enabled() or await _dlp_capabilities() is None:
+        raise HTTPException(status_code=503, detail="Audio processing is unavailable")
+    allocation = await _dlp_json("POST", "/v2/jobs", claims)
+    dlp_job_id = str(allocation.get("jobId") or "")
+    try:
+        uuid.UUID(dlp_job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Audio processing allocation failed") from exc
+    allowed_options = {
+        "quality", "codec", "container", "audioFormat", "audioBitrate",
+        "preferBetterAudio", "dubLanguage", "filenameStyle", "subtitleLanguage",
+    }
+    payload = {key: value for key, value in directive.options.items() if key in allowed_options}
+    payload["url"] = str(directive.source_url)
+    await _dlp_json("POST", f"/v2/jobs/{dlp_job_id}/submit", claims, payload)
+    deadline = time.monotonic() + _bounded_env_int(
+        "PINCHANA_V2_TELEGRAM_JOB_WAIT_SECONDS", 180, 10, 900
+    )
+    status: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        status = await _dlp_json("GET", f"/v2/jobs/{dlp_job_id}", claims)
+        state = str(status.get("status") or "").upper()
+        if state == "READY":
+            break
+        if state in {"FAILED", "EXPIRED", "CANCELLED"}:
+            raise HTTPException(status_code=502, detail="Audio processing failed")
+        await asyncio.sleep(1)
+    else:
+        raise HTTPException(status_code=504, detail="Audio processing timed out")
+    descriptor = RemoteAssetDescriptor(
+        index=0,
+        media_type="audio",
+        role="content",
+        availability="full",
+        filename=str(directive.options.get("filename") or f"{extracted.shortcode}.mp3"),
+        mime_type=status.get("mime"),
+        credential_ref=f"dlp.{dlp_job_id}",
+        size=status.get("size"),
+        duration_seconds=extracted.duration_seconds,
+        supports_range=True,
+        expires_at=status.get("expiresAt"),
+        asset_id=str(directive.options.get("asset_id") or f"ytmusic:{extracted.shortcode}:full"),
+        source_fingerprint=str(directive.options.get("source_fingerprint") or extracted.shortcode),
+    )
+    if forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    dlp_url, _token = _dlp_config()
+    response = await forward_client.send(
+        forward_client.build_request(
+            "GET",
+            f"{dlp_url}/v2/jobs/{dlp_job_id}/file",
+            headers=_dlp_headers(claims),
+        ),
+        stream=True,
+    )
+    if response.status_code >= 400:
+        await response.aclose()
+        raise HTTPException(status_code=502, detail="Processed audio delivery failed")
+    return descriptor, response, None
+
+
+async def _process_v2_telegram_audio(
+    request: ScrapeRequest,
+    *,
+    platform: str,
+    mode: str,
+    target: Any,
+    client_name: str,
+) -> ScrapeV2TelegramResponse:
+    extracted = await _extract_v2_for_telegram(
+        request, platform=platform, mode=mode, target=target
+    )
+    collection = [
+        {
+            "index": item.index,
+            "item_id": item.item_id,
+            "title": item.title,
+            "artist": item.artist,
+            "album": item.album,
+            "duration_seconds": item.duration_seconds,
+            "availability": item.availability,
+            "delivery_status": (
+                "processing-required" if item.processing else "select-item" if item.assets else "unavailable"
+            ),
+        }
+        for item in sorted(extracted.collection, key=lambda value: value.index)
+    ]
+    downloadable_audio = [
+        descriptor for descriptor in extracted.assets if descriptor.media_type == "audio"
+    ]
+    if not downloadable_audio and extracted.processing is None:
+        return ScrapeV2TelegramResponse(
+            status="ready",
+            request_id=str(uuid.uuid4()),
+            source={"platform": platform, "url": str(request.url)},
+            content={
+                "shortcode": extracted.shortcode,
+                "caption": extracted.caption,
+                "title": extracted.caption,
+                "album": extracted.album,
+                "duration_seconds": extracted.duration_seconds,
+                "availability": extracted.availability,
+                "classifications": extracted.classifications,
+                "item_count": extracted.collection_total or len(collection),
+                "resolved_item_count": len(collection),
+                "collection_truncated": extracted.collection_truncated,
+            },
+            author={"name": extracted.author, "username": extracted.author},
+            assets=[],
+            collection=collection,
+        )
+
+    cache_root = storage.base_path.resolve()
+    post_dir = (cache_root / extracted.shortcode).resolve()
+    try:
+        post_dir.relative_to(cache_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid audio cache identity") from exc
+    post_dir.mkdir(parents=True, exist_ok=True)
+    telegram_assets: list[TelegramAssetV2] = []
+    descriptors = list(extracted.assets)
+    dlp_response = None
+    if extracted.processing is not None:
+        descriptor, dlp_response, _client = await _telegram_dlp_descriptor(
+            extracted, client_name=client_name
+        )
+        descriptors = [descriptor]
+
+    for descriptor in descriptors:
+        if dlp_response is not None and descriptor is descriptors[0]:
+            response, owned_client = dlp_response, None
+            dlp_response = None
+        else:
+            response, owned_client = await _open_telegram_descriptor(descriptor, platform)
+        partial: Path | None = None
+        try:
+            if response.status_code >= 400:
+                raise HTTPException(status_code=502, detail="Audio asset delivery failed")
+            actual_mime = response.headers.get("content-type") or descriptor.mime_type
+            filename = normalized_filename(descriptor.filename, actual_mime)
+            destination = (post_dir / f"{descriptor.index:03d}-{filename}").resolve()
+            destination.relative_to(post_dir)
+            partial = destination.with_suffix(destination.suffix + ".part")
+            with partial.open("wb") as output:
+                async for chunk in response.aiter_raw():
+                    output.write(chunk)
+            partial.replace(destination)
+        except Exception:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
+            raise
+        finally:
+            await response.aclose()
+            if owned_client is not None:
+                await owned_client.aclose()
+        fingerprint = descriptor.source_fingerprint or hashlib.sha256(
+            f"{descriptor.asset_id}:{descriptor.availability}".encode()
+        ).hexdigest()
+        asset_key = f"{descriptor.asset_id or f'{platform}:{extracted.shortcode}:{descriptor.index}'}:{descriptor.availability}"
+        profile = f"telegram-audio-v1-{descriptor.availability}"
+        relative = str(destination.relative_to(cache_root))
+        delivery = TelegramAssetDelivery(
+            kind="shared-cache",
+            normalization_profile=profile,
+            relative_variant_path=relative,
+            asset_key=asset_key,
+            source_fingerprint=fingerprint,
+            cache_key=f"{asset_key}:{profile}:{fingerprint}",
+            streamability_status="compatible",
+        )
+        telegram_assets.append(TelegramAssetV2(
+            id=f"{extracted.shortcode}-{descriptor.index}",
+            asset_key=asset_key,
+            index=descriptor.index,
+            type=descriptor.media_type,
+            role=descriptor.role,
+            availability=descriptor.availability,
+            filename=destination.name,
+            mime_type=actual_mime,
+            size=destination.stat().st_size,
+            duration_seconds=descriptor.duration_seconds,
+            title=extracted.caption,
+            artist=extracted.author,
+            delivery=delivery,
+        ))
+    return ScrapeV2TelegramResponse(
+        status="ready",
+        request_id=str(uuid.uuid4()),
+        source={"platform": platform, "url": str(request.url)},
+        content={
+            "shortcode": extracted.shortcode,
+            "caption": extracted.caption,
+            "title": extracted.caption,
+            "album": extracted.album,
+            "duration_seconds": extracted.duration_seconds,
+            "availability": extracted.availability,
+            "classifications": extracted.classifications,
+            "item_count": extracted.collection_total or len(collection),
+            "resolved_item_count": len(collection),
+            "collection_truncated": extracted.collection_truncated,
+        },
+        author={"name": extracted.author, "username": extracted.author},
+        assets=telegram_assets,
+        collection=collection,
+    )
+
+
 @app.post(
     "/v2/telegram/scrape",
     response_model=ScrapeV2TelegramResponse,
@@ -1921,6 +2613,18 @@ async def process_v2_telegram_scrape(
     """Authenticated endpoint reserved for Telegram Bot API delivery normalization."""
     logger.info("authenticated_v2_telegram_scrape client=%s", client_name)
     url = str(request.url)
+    mode, native_name, native_target = _resolve_module(url)
+    if (
+        native_name in {"soundcloud", "spotify", "deezer", "ytmusic"}
+        and _v2_platform_enabled(str(native_name))
+    ):
+        return await _process_v2_telegram_audio(
+            request,
+            platform=str(native_name),
+            mode=str(mode),
+            target=native_target,
+            client_name=client_name,
+        )
     platform, payload = await _process_scrape_payload(request, http_request)
     try:
         normalized = await normalize_scrape_response(

@@ -26,7 +26,7 @@ class MediaDimensions(BaseModel):
 class MediaAsset(BaseModel):
     index: int = Field(ge=0)
     type: Literal["image", "video", "audio"]
-    role: Literal["content", "soundtrack", "cover"]
+    role: Literal["content", "soundtrack", "preview", "cover", "artwork"]
     url: str = Field(min_length=1)
     preview_url: str | None = None
     dimensions: MediaDimensions | None = None
@@ -128,7 +128,8 @@ class WebAssetV2(BaseModel):
     asset_key: str
     index: int
     type: Literal["image", "video", "audio"]
-    role: Literal["content", "soundtrack", "cover"]
+    role: Literal["content", "soundtrack", "preview", "cover", "artwork"]
+    availability: Literal["full", "preview", "metadata-only"] = "full"
     filename: str
     mime_type: str | None = None
     size: int | None = None
@@ -139,12 +140,32 @@ class WebAssetV2(BaseModel):
     delivery: WebAssetTunnelDelivery | WebAssetJobDelivery
 
 
+class WebCollectionItemV2(BaseModel):
+    index: int = Field(ge=0)
+    item_id: str = Field(min_length=1)
+    title: str
+    artist: str | None = None
+    album: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    availability: Literal["full", "preview", "metadata-only"]
+    classifications: list[str] = Field(default_factory=list)
+    asset_count: int = Field(default=0, ge=0)
+    delivery_status: Literal["select-item", "processing-required", "unavailable"]
+
+
 class ScrapeV2Content(BaseModel):
     shortcode: str = Field(min_length=1)
     title: str | None = None
     text: str | None = None
     html: str | None = None
     published_at: datetime | None = None
+    album: str | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    availability: Literal["full", "preview", "metadata-only"] = "full"
+    classifications: list[str] = Field(default_factory=list)
+    item_count: int = Field(default=0, ge=0)
+    resolved_item_count: int = Field(default=0, ge=0)
+    collection_truncated: bool = False
 
 
 class ScrapeV2WebReadyResponse(BaseModel):
@@ -154,6 +175,7 @@ class ScrapeV2WebReadyResponse(BaseModel):
     content: ScrapeV2Content
     author: ScrapeAuthor
     assets: list[WebAssetV2]
+    collection: list[WebCollectionItemV2] = Field(default_factory=list)
 
 
 class ScrapeV2WebProcessingResponse(BaseModel):
@@ -162,3 +184,4 @@ class ScrapeV2WebProcessingResponse(BaseModel):
     job_id: str
     status_url: str
     expires_at: int
+    retry_after: int = 2

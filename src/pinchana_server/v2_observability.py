@@ -6,7 +6,17 @@ from collections import Counter, defaultdict
 from threading import Lock
 
 
-PLATFORMS = frozenset({"instagram", "tiktok", "threads", "twitter", "unknown"})
+PLATFORMS = frozenset({
+    "instagram",
+    "tiktok",
+    "threads",
+    "twitter",
+    "soundcloud",
+    "spotify",
+    "deezer",
+    "ytmusic",
+    "unknown",
+})
 
 
 class V2Observability:
