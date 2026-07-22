@@ -96,6 +96,9 @@ This compatibility route uses the same authentication, request validation, routi
 - `GET /web/session` validates that token.
 - `GET /web/build` publicly exposes the sanitized source revisions included in the deployment; it never returns configuration or infrastructure details.
 - `POST /v1/web/scrape` returns the same normalized v1 contract as `/v1/scrape`, authenticates with the browser-session bearer token, and places protected assets under `/web/media/...`.
+- `POST /v2/scrape` negotiates native remote extraction for Instagram, TikTok, Threads, and Twitter/X and returns only session-bound ticket or processing-job URLs.
+- `GET /v2/assets/{ticket}` streams a Range-capable upstream or ephemeral spool file without exposing signed upstream URLs or credential references.
+- `GET /v2/jobs/{job}` polls a session-bound ephemeral spool job.
 - `POST /web/scrape` performs a scrape with the browser-session bearer token.
 - `GET /web/media/...` serves protected media to a verified web session.
 - `GET /web/capabilities` advertises optional protocol-v2 DLP support.
@@ -122,12 +125,26 @@ Returns a list of all configured modules and their status.
 | `CONTAINER_MODE` | `false` | Enable Docker container management features. |
 | `MODULES_CONFIG` | `/app/config/modules.yaml` | Path to the module routing configuration. |
 | `CACHE_PATH` | `./cache` | Base path for serving cached media. |
+| `PINCHANA_API_KEYS` | unset | JSON map of named machine credentials. |
+| `PINCHANA_API_KEY_SCOPES` | unset | Server-side JSON map of credential scopes; Telegram delivery requires `delivery:telegram`. |
+| `REDIS_URL` | unset | Shared ticket and normalization-lock store required for multi-worker deployments. |
+| `PINCHANA_V2_INSTAGRAM` | `true` | Enable native Instagram v2 web extraction. |
+| `PINCHANA_V2_TIKTOK` | `false` | Enable native TikTok v2 web extraction. |
+| `PINCHANA_V2_THREADS` | `false` | Enable native Threads v2 web extraction. |
+| `PINCHANA_V2_TWITTER` | `false` | Enable native Twitter/X v2 web extraction. |
+| `PINCHANA_INTERNAL_TOKEN` | development-only default | Shared internal credential-resolver secret; replace outside local development. |
+| `V2_SPOOL_PATH` | `./spool` | Ephemeral v2 processing directory, kept separate from `CACHE_PATH`. |
+| `V2_SPOOL_MAX_BYTES` | `1073741824` | Per-asset spool download limit. |
+| `PINCHANA_API_REPLICAS` | `1` | Actual API container/host replica count used by the spool topology guard. |
+| `V2_SPOOL_SHARED` | `false` | Explicitly confirms every replica mounts the same shared filesystem at `V2_SPOOL_PATH`; Redis alone is insufficient. |
 | `PINCHANA_INSTANCE_CERTIFICATE` | unset | Project-issued JSON certificate envelope for this public origin. |
 | `PINCHANA_INSTANCE_CERTIFICATE_FILE` | unset | Mounted certificate file used instead of the inline value. |
 | `PINCHANA_BUILD_COMMIT` | unset | Parent API commit baked into official images; used as a manifest fallback. |
 | `PINCHANA_BUILD_COMMITS` | unset | JSON map of public API and module commits, normally baked by release CI. |
 
 See [Instance certificates](../docs/INSTANCE_TRUST.md) for issuance and security boundaries.
+See [the Phase 4A rollout checklist](../docs/V2_PHASE_4A_ROLLOUT.md) for
+multi-worker, multi-container, and cross-host spool requirements.
 
 ---
 

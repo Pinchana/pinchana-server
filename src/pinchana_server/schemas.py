@@ -105,3 +105,60 @@ class ApiError(BaseModel):
 
 class ApiErrorResponse(BaseModel):
     error: ApiError
+
+
+# ---------------------------------------------------------------------------
+# v2 Public Web Response Schemas
+# ---------------------------------------------------------------------------
+class WebAssetTunnelDelivery(BaseModel):
+    kind: Literal["tunnel"] = "tunnel"
+    url: str
+    expires_at: int
+
+
+class WebAssetJobDelivery(BaseModel):
+    kind: Literal["job"] = "job"
+    job_id: str
+    status_url: str
+    expires_at: int
+
+
+class WebAssetV2(BaseModel):
+    id: str
+    asset_key: str
+    index: int
+    type: Literal["image", "video", "audio"]
+    role: Literal["content", "soundtrack", "cover"]
+    filename: str
+    mime_type: str | None = None
+    size: int | None = None
+    dimensions: MediaDimensions | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    bitrate: int | None = Field(default=None, ge=0)
+    looping: bool = False
+    delivery: WebAssetTunnelDelivery | WebAssetJobDelivery
+
+
+class ScrapeV2Content(BaseModel):
+    shortcode: str = Field(min_length=1)
+    title: str | None = None
+    text: str | None = None
+    html: str | None = None
+    published_at: datetime | None = None
+
+
+class ScrapeV2WebReadyResponse(BaseModel):
+    status: Literal["ready"] = "ready"
+    request_id: str
+    source: ScrapeSource
+    content: ScrapeV2Content
+    author: ScrapeAuthor
+    assets: list[WebAssetV2]
+
+
+class ScrapeV2WebProcessingResponse(BaseModel):
+    status: Literal["processing"] = "processing"
+    request_id: str
+    job_id: str
+    status_url: str
+    expires_at: int

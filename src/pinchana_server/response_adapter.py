@@ -238,13 +238,17 @@ async def normalize_scrape_response(
     *,
     platform: Platform,
     source_url: str,
-    probe: MediaDimensionProbe,
+    probe: MediaDimensionProbe | None,
 ) -> ScrapeV1Response:
     descriptors = _media_descriptors(raw)
-    dimensions = await asyncio.gather(*(
-        probe.dimensions_for(item["url"], item["type"])
-        for item in descriptors
-    ))
+    dimensions = (
+        await asyncio.gather(*(
+            probe.dimensions_for(item["url"], item["type"])
+            for item in descriptors
+        ))
+        if probe is not None
+        else [None] * len(descriptors)
+    )
     media = [
         MediaAsset(index=index, dimensions=dimensions[index], **item)
         for index, item in enumerate(descriptors)

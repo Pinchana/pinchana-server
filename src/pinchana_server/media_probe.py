@@ -35,12 +35,13 @@ class MediaDimensionProbe:
         _platform, post_id, filename = parts
         if ".." in filename or filename.startswith("/"):
             return None
-        resolved = (self.base_path / post_id / filename).resolve()
+        candidate = self.base_path / post_id / filename
+        resolved = candidate.resolve()
         try:
             resolved.relative_to(self.base_path.resolve())
         except ValueError:
             return None
-        return resolved
+        return candidate
 
     async def dimensions_for(self, url: str, media_type: str) -> MediaDimensions | None:
         if media_type not in {"image", "video"}:

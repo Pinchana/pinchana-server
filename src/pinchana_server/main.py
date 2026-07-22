@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -22,12 +23,24 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
+import urllib.parse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from pinchana_core.models import ScrapeRequest, ScrapeResponse
+from pinchana_core.models import (
+    RemoteAssetDescriptor,
+    ScrapeRequest,
+    ScrapeResponse,
+    ScrapeV2Context,
+    ScrapeV2ExtractedData,
+    ScraperCapabilitiesV2,
+    TelegramDeliveryDescriptor,
+    TelegramAssetDelivery,
+    TelegramAssetV2,
+    ScrapeV2TelegramResponse,
+)
 from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
 from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
@@ -35,14 +48,46 @@ from pinchana_core.vpn import GluetunController, VpnRotationError
 
 from .media_probe import MediaDimensionProbe
 from .response_adapter import normalize_scrape_response
-from .schemas import ApiErrorResponse, ScrapeV1Response
+from .ssrf import pinned_httpx_transport, validate_upstream_url
+from .tickets import InMemoryTicketStore, RedisTicketStore, TicketData, TicketStore
+from .telegram_normalizer import TelegramNormalizer
+from .v2_observability import v2_observability
+from .v2_runtime import normalized_filename, validate_internal_token, validate_spool_topology
+from .schemas import (
+    ApiErrorResponse,
+    MediaDimensions,
+    ScrapeAuthor,
+    ScrapeContent,
+    ScrapeSource,
+    ScrapeV1Response,
+    ScrapeV2WebProcessingResponse,
+    ScrapeV2WebReadyResponse,
+    ScrapeV2Content,
+    WebAssetTunnelDelivery,
+    WebAssetV2,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+ticket_store: TicketStore = InMemoryTicketStore(check_workers=False)
+normalization_redis: Any | None = None
+telegram_normalizer = TelegramNormalizer()
+
+V2_PLATFORM_FLAGS = {
+    "instagram": ("PINCHANA_V2_INSTAGRAM", True),
+    "tiktok": ("PINCHANA_V2_TIKTOK", False),
+    "threads": ("PINCHANA_V2_THREADS", False),
+    "twitter": ("PINCHANA_V2_TWITTER", False),
+}
+V2_TICKET_TTL_SECONDS = 7200
+V2_UPSTREAM_SAFETY_MARGIN_SECONDS = 60
+V2_MIN_DIRECT_TTL_SECONDS = 60
+
 TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 TURNSTILE_TEST_SECRET_KEYS = {
     "1x0000000000000000000000000000000AA",
+
     "2x0000000000000000000000000000000AA",
     "3x0000000000000000000000000000000AA",
 }
@@ -258,6 +303,40 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> str:
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _require_telegram_scope(
+    x_api_key: str | None = Header(default=None),
+) -> str:
+    client_name = _require_api_key(x_api_key)
+
+    raw_scopes = os.getenv("PINCHANA_API_KEY_SCOPES", "")
+    client_scopes: set[str] = set()
+    if raw_scopes:
+        try:
+            scopes_dict = json.loads(raw_scopes)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=503, detail="API scope configuration is invalid") from exc
+        if not isinstance(scopes_dict, dict):
+            raise HTTPException(status_code=503, detail="API scope configuration is invalid")
+        configured = scopes_dict.get(client_name, [])
+        if isinstance(configured, list) and all(isinstance(scope, str) for scope in configured):
+            client_scopes.update(scope.strip() for scope in configured if scope.strip())
+        elif isinstance(configured, str):
+            client_scopes.update(scope.strip() for scope in configured.split(",") if scope.strip())
+        else:
+            raise HTTPException(status_code=503, detail="API scope configuration is invalid")
+
+    env_specific = os.getenv(f"API_KEY_SCOPES_{client_name.upper()}", "")
+    if env_specific:
+        client_scopes.update(s.strip() for s in env_specific.split(",") if s.strip())
+
+    if "delivery:telegram" not in client_scopes:
+        raise HTTPException(
+            status_code=403,
+            detail="Client credential does not have delivery:telegram scope",
+        )
+    return client_name
+
+
 def _urlsafe_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
@@ -439,7 +518,16 @@ def _valid_turnstile_result(result: Any, *, enforce_metadata: bool = True) -> bo
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global forward_client, internal_client
+    global forward_client, internal_client, ticket_store, normalization_redis
+    validate_spool_topology()
+    validate_internal_token()
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if redis_url:
+        ticket_store = RedisTicketStore(redis_url)
+        normalization_redis = ticket_store.redis
+    else:
+        ticket_store = InMemoryTicketStore(check_workers=True)
+        normalization_redis = None
     forward_client = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=10.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
@@ -449,11 +537,16 @@ async def lifespan(app: FastAPI):
         base_url="http://pinchana.internal",
         timeout=120.0,
     )
+    protected_spool_dirs = await _recover_ephemeral_jobs()
+    _prune_stale_spool_directories(protected_spool_dirs)
     try:
         yield
     finally:
+        await _shutdown_spool_tasks()
         await forward_client.aclose()
         await internal_client.aclose()
+        if isinstance(ticket_store, RedisTicketStore):
+            await ticket_store.redis.aclose()
         await storage.close()
 
 
@@ -597,6 +690,33 @@ def _resolve_module(url: str):
                 return "container", name, module
 
     return None, None, None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _v2_platform_enabled(platform: str) -> bool:
+    configured = V2_PLATFORM_FLAGS.get(platform)
+    return bool(configured and _env_flag(*configured))
+
+
+def _descriptor_ticket_ttl(descriptor: RemoteAssetDescriptor) -> int:
+    if descriptor.expires_at is None:
+        return V2_TICKET_TTL_SECONDS
+    remaining = descriptor.expires_at - int(time.time()) - V2_UPSTREAM_SAFETY_MARGIN_SECONDS
+    return min(V2_TICKET_TTL_SECONDS, remaining)
+
+
+def _descriptor_can_tunnel(descriptor: RemoteAssetDescriptor) -> bool:
+    if not descriptor.supports_range:
+        return False
+    if descriptor.credential_ref:
+        return _descriptor_ticket_ttl(descriptor) >= V2_MIN_DIRECT_TTL_SECONDS
+    return _descriptor_ticket_ttl(descriptor) >= V2_MIN_DIRECT_TTL_SECONDS
 
 
 async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dict[str, Any]:
@@ -888,6 +1008,1045 @@ async def process_v1_web_scrape_request(
     result = await _normalized_scrape_response(request, http_request)
     rewritten = _rewrite_media_urls(result.model_dump(), "/web/media")
     return ScrapeV1Response.model_validate(rewritten)
+
+
+# ---------------------------------------------------------------------------
+# v2 Web Zero-Cache & Asset Streaming Endpoints
+# ---------------------------------------------------------------------------
+def _get_instance_id(claims: dict[str, Any]) -> str:
+    return claims.get("issuer", "pinchana-project")
+
+
+async def _stream_credential_asset(ticket: TicketData, request: Request):
+    reference = ticket.descriptor.credential_ref or ""
+    module_name = reference.split(".", 1)[0]
+    plugin = registry.get(module_name)
+    module = container_registry.modules.get(module_name)
+    if plugin is not None:
+        client = internal_client
+        base = f"/{module_name}"
+    elif module is not None:
+        client = forward_client
+        base = module.endpoint.rstrip("/")
+    else:
+        raise HTTPException(status_code=502, detail="Credential resolver is unavailable")
+    if client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+
+    headers = {
+        "X-Pinchana-Internal-Token": os.getenv(
+            "PINCHANA_INTERNAL_TOKEN", "pinchana-local-development"
+        )
+    }
+    for name in ("range", "if-range"):
+        if value := request.headers.get(name):
+            headers[name] = value
+    response = await client.send(
+        client.build_request(
+            request.method,
+            f"{base}/v2/internal/assets/{urllib.parse.quote(reference, safe='._-')}",
+            headers=headers,
+        ),
+        stream=True,
+    )
+    if response.status_code >= 400 and response.status_code != 416:
+        await response.aclose()
+        v2_observability.increment("credential_resolution_failure", platform=module_name)
+        raise HTTPException(status_code=502, detail="Credentialed asset delivery failed")
+    output_headers = {
+        name: value
+        for name in (
+            "accept-ranges", "content-length", "content-range", "content-type", "etag", "last-modified"
+        )
+        if (value := response.headers.get(name))
+    }
+    output_headers["Cache-Control"] = "private, no-store"
+    output_headers["X-Content-Type-Options"] = "nosniff"
+    delivered_filename = normalized_filename(
+        ticket.descriptor.filename, response.headers.get("content-type")
+    )
+    output_headers["Content-Disposition"] = f'attachment; filename="{delivered_filename}"'
+    v2_observability.increment(f"upstream_{response.status_code}", platform=module_name)
+    if request.method == "HEAD":
+        await response.aclose()
+        return Response(status_code=response.status_code, headers=output_headers)
+
+    async def body():
+        try:
+            async for chunk in response.aiter_raw():
+                yield chunk
+        finally:
+            await response.aclose()
+            await ticket_store.release_lease(ticket.ticket_id)
+
+    return StreamingResponse(body(), status_code=response.status_code, headers=output_headers)
+
+
+async def _stream_v2_asset(ticket: TicketData, request: Request):
+    if ticket.spool_path:
+        spool_file = Path(ticket.spool_path)
+        if not spool_file.is_file():
+            raise HTTPException(status_code=404, detail="Spool media file expired or not found")
+        return FileResponse(
+            spool_file,
+            filename=ticket.descriptor.filename,
+            media_type=ticket.descriptor.mime_type,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+            background=(
+                BackgroundTask(ticket_store.release_lease, ticket.ticket_id)
+                if request.method != "HEAD"
+                else None
+            ),
+        )
+
+    if ticket.descriptor.credential_ref:
+        return await _stream_credential_asset(ticket, request)
+
+    current_url = ticket.descriptor.upstream_url
+    if not current_url:
+        raise HTTPException(status_code=502, detail="Asset has no delivery source")
+
+    # Safe headers whitelist
+    upstream_headers = {}
+    if ticket.descriptor.safe_headers:
+        for k, v in ticket.descriptor.safe_headers.items():
+            if k.lower() in {"user-agent", "referer", "accept", "accept-language"}:
+                upstream_headers[k] = str(v)
+
+    # Forward client range headers
+    for name in ("range", "if-range"):
+        if val := request.headers.get(name):
+            upstream_headers[name] = val
+
+    hops = 0
+    max_hops = 5
+
+    while hops < max_hops:
+        try:
+            current_url, resolved_ip = validate_upstream_url(current_url)
+        except HTTPException as exc:
+            v2_observability.increment("ssrf_rejection")
+            raise HTTPException(
+                status_code=502, detail="Upstream asset rejected by network policy"
+            ) from exc
+        hostname = urllib.parse.urlparse(current_url).hostname
+        if not hostname:
+            raise HTTPException(status_code=400, detail="Missing upstream hostname")
+        pinned_client = httpx.AsyncClient(
+            transport=pinned_httpx_transport(hostname, resolved_ip),
+            timeout=httpx.Timeout(120.0, connect=10.0),
+        )
+        method = request.method
+        req = pinned_client.build_request(method, current_url, headers=upstream_headers)
+        try:
+            resp = await pinned_client.send(req, stream=True)
+        except Exception:
+            await pinned_client.aclose()
+            raise
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location")
+            await resp.aclose()
+            await pinned_client.aclose()
+            if not location:
+                raise HTTPException(status_code=502, detail="Upstream redirect missing Location header")
+            next_url = urllib.parse.urljoin(current_url, location)
+            # Strip auth headers on cross-origin redirects
+            if urllib.parse.urlparse(next_url).netloc != urllib.parse.urlparse(current_url).netloc:
+                upstream_headers.pop("authorization", None)
+                upstream_headers.pop("cookie", None)
+                upstream_headers.pop("Referer", None)
+                upstream_headers.pop("referer", None)
+            current_url = next_url
+            hops += 1
+            continue
+
+        if resp.status_code >= 400 and resp.status_code != 416:
+            await resp.aclose()
+            await pinned_client.aclose()
+            raise HTTPException(status_code=resp.status_code, detail="Upstream asset returned an error")
+
+        out_headers = {}
+        for name in (
+            "accept-ranges",
+            "content-length",
+            "content-range",
+            "content-type",
+            "etag",
+            "last-modified",
+        ):
+            if val := resp.headers.get(name):
+                out_headers[name] = val
+
+        out_headers["Cache-Control"] = "private, no-store"
+        out_headers["X-Content-Type-Options"] = "nosniff"
+        delivered_filename = normalized_filename(
+            ticket.descriptor.filename, resp.headers.get("content-type")
+        )
+        out_headers["Content-Disposition"] = f'attachment; filename="{delivered_filename}"'
+        v2_observability.increment(f"upstream_{resp.status_code}")
+
+        if method == "HEAD":
+            await resp.aclose()
+            await pinned_client.aclose()
+            return Response(status_code=resp.status_code, headers=out_headers)
+
+        async def _body_stream():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await pinned_client.aclose()
+                await ticket_store.release_lease(ticket.ticket_id)
+
+        return StreamingResponse(
+            _body_stream(),
+            status_code=resp.status_code,
+            headers=out_headers,
+        )
+
+    raise HTTPException(status_code=502, detail="Too many upstream redirects")
+
+
+# ---------------------------------------------------------------------------
+# v2 Ephemeral Spool Jobs (Zero Persistent Cache)
+# ---------------------------------------------------------------------------
+ephemeral_jobs: dict[str, dict[str, Any]] = {}
+ephemeral_jobs_lock = asyncio.Lock()
+spool_tasks: dict[str, asyncio.Task[Any]] = {}
+
+
+def _ephemeral_job_key(job_id: str) -> str:
+    return f"pinchana:v2:job:{job_id}"
+
+
+async def _set_ephemeral_job(job_id: str, job: dict[str, Any]) -> None:
+    if normalization_redis is not None:
+        ttl = max(1, int(job.get("expires_at", int(time.time()) + 300)) - int(time.time()))
+        # Retain the record briefly past logical expiry so polling can clean the
+        # shared spool directory and return 410 instead of losing ownership data.
+        await normalization_redis.set(
+            _ephemeral_job_key(job_id), json.dumps(job), ex=ttl + 300
+        )
+        return
+    async with ephemeral_jobs_lock:
+        ephemeral_jobs[job_id] = job
+
+
+async def _get_ephemeral_job(job_id: str) -> dict[str, Any] | None:
+    if normalization_redis is not None:
+        raw = await normalization_redis.get(_ephemeral_job_key(job_id))
+        if not raw:
+            return None
+        return json.loads(raw)
+    async with ephemeral_jobs_lock:
+        job = ephemeral_jobs.get(job_id)
+        return dict(job) if job else None
+
+
+async def _delete_ephemeral_job(job_id: str) -> None:
+    if normalization_redis is not None:
+        await normalization_redis.delete(_ephemeral_job_key(job_id))
+        return
+    async with ephemeral_jobs_lock:
+        ephemeral_jobs.pop(job_id, None)
+
+
+def _track_spool_task(job_id: str, task: asyncio.Task[Any]) -> None:
+    spool_tasks[job_id] = task
+    task.add_done_callback(lambda _task: spool_tasks.pop(job_id, None))
+
+
+async def _shutdown_spool_tasks() -> None:
+    active = list(spool_tasks.items())
+    for _job_id, task in active:
+        task.cancel()
+    if active:
+        await asyncio.gather(*(task for _, task in active), return_exceptions=True)
+    for job_id, _task in active:
+        job = await _get_ephemeral_job(job_id)
+        if not job or job.get("status") != "processing":
+            continue
+        await _cleanup_job_spool(job)
+        job.update({
+            "status": "failed",
+            "error": "Processing stopped during shutdown; retry the request",
+            "expires_at": int(time.time()) + 300,
+            "spool_dir": None,
+            "spool_files": [],
+            "ticket_ids": [],
+        })
+        await _set_ephemeral_job(job_id, job)
+        v2_observability.increment("processing_job_failure", platform=job.get("platform"))
+
+
+def _spool_root() -> Path:
+    return Path(os.getenv("V2_SPOOL_PATH", "./spool")).resolve()
+
+
+def _safe_spool_path(raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+    root = _spool_root()
+    candidate = Path(raw_path).resolve()
+    return candidate if candidate.is_relative_to(root) else None
+
+
+async def _job_has_active_leases(job: dict[str, Any]) -> bool:
+    for ticket_id in job.get("ticket_ids") or []:
+        ticket = await ticket_store.get_ticket(str(ticket_id))
+        if ticket and ticket.active_leases > 0:
+            return True
+    return False
+
+
+async def _cleanup_job_spool(job: dict[str, Any]) -> bool:
+    if await _job_has_active_leases(job):
+        return False
+    spool_dir = _safe_spool_path(job.get("spool_dir"))
+    if spool_dir and spool_dir.is_dir():
+        shutil.rmtree(spool_dir, ignore_errors=True)
+        v2_observability.increment("spool_cleanup")
+    for ticket_id in job.get("ticket_ids") or []:
+        await ticket_store.delete_ticket(str(ticket_id))
+    return True
+
+
+def _job_spool_files_available(job: dict[str, Any]) -> bool:
+    files = job.get("spool_files") or []
+    if not files:
+        return False
+    return all(
+        (candidate := _safe_spool_path(str(raw))) is not None
+        and candidate.is_file()
+        and candidate.stat().st_size > 0
+        for raw in files
+    )
+
+
+async def _recover_ephemeral_jobs() -> set[Path]:
+    """Recover safe ready jobs and fail interrupted work after a restart."""
+    protected: set[Path] = set()
+    if normalization_redis is None:
+        return protected
+    async for key in normalization_redis.scan_iter(match="pinchana:v2:job:*"):
+        raw = await normalization_redis.get(key)
+        if not raw:
+            continue
+        try:
+            job = json.loads(raw)
+        except (TypeError, ValueError):
+            await normalization_redis.delete(key)
+            continue
+        job_id = str(key).rsplit(":", 1)[-1]
+        status = job.get("status")
+        expired = int(job.get("expires_at", 0)) <= int(time.time())
+        if expired:
+            if await _cleanup_job_spool(job):
+                await _delete_ephemeral_job(job_id)
+                v2_observability.increment("processing_job_expiry", platform=job.get("platform"))
+            continue
+        if status == "processing":
+            await _cleanup_job_spool(job)
+            job.update({
+                "status": "failed",
+                "error": "Processing was interrupted; retry the request",
+                "expires_at": int(time.time()) + 300,
+                "spool_dir": None,
+                "spool_files": [],
+                "ticket_ids": [],
+            })
+            await _set_ephemeral_job(job_id, job)
+            v2_observability.increment("processing_job_failure", platform=job.get("platform"))
+            continue
+        if status == "ready" and not _job_spool_files_available(job):
+            await _cleanup_job_spool(job)
+            job.update({
+                "status": "failed",
+                "error": "Processed media is unavailable; retry the request",
+                "expires_at": int(time.time()) + 300,
+                "spool_dir": None,
+                "spool_files": [],
+                "ticket_ids": [],
+            })
+            await _set_ephemeral_job(job_id, job)
+            v2_observability.increment("processing_job_failure", platform=job.get("platform"))
+            continue
+        spool_dir = _safe_spool_path(job.get("spool_dir"))
+        if spool_dir:
+            protected.add(spool_dir)
+    return protected
+
+
+def _prune_stale_spool_directories(protected: set[Path] | None = None) -> None:
+    spool_root = Path(os.getenv("V2_SPOOL_PATH", "./spool")).resolve()
+    if not spool_root.is_dir():
+        return
+    protected = protected or set()
+    cutoff = time.time() - 3 * 60 * 60
+    for candidate in spool_root.iterdir():
+        try:
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(spool_root) or resolved in protected:
+                continue
+            if candidate.is_dir() and candidate.stat().st_mtime < cutoff:
+                shutil.rmtree(candidate, ignore_errors=True)
+                v2_observability.increment("spool_cleanup")
+            elif candidate.is_dir():
+                for partial in candidate.glob("*.part"):
+                    if partial.is_file() and partial.stat().st_mtime < time.time() - 10 * 60:
+                        partial.unlink(missing_ok=True)
+                        v2_observability.increment("spool_cleanup")
+        except OSError:
+            logger.warning("ephemeral_spool_cleanup_stat_failed")
+
+
+async def _expire_ephemeral_job(job_id: str, expires_at: int) -> None:
+    await asyncio.sleep(max(0, expires_at - int(time.time())) + 1)
+    job = await _get_ephemeral_job(job_id)
+    if not job or int(job.get("expires_at", 0)) > int(time.time()):
+        return
+    if not await _cleanup_job_spool(job):
+        asyncio.create_task(_expire_ephemeral_job(job_id, int(time.time()) + 30))
+        return
+    await _delete_ephemeral_job(job_id)
+    v2_observability.increment("processing_job_expiry", platform=job.get("platform"))
+
+
+async def _run_ephemeral_spool_job(
+    job_id: str,
+    url: str,
+    module_name: str,
+    session_nonce: str,
+    instance_id: str,
+    extracted: ScrapeV2ExtractedData,
+):
+    started_at = time.monotonic()
+    spool_root = Path(os.getenv("V2_SPOOL_PATH", "./spool")).resolve()
+    spool_dir = (spool_root / job_id).resolve()
+    if not spool_dir.is_relative_to(spool_root):
+        raise RuntimeError("invalid spool path")
+    spool_dir.mkdir(parents=True, exist_ok=False)
+    processing_job = await _get_ephemeral_job(job_id)
+    if processing_job and processing_job.get("status") == "processing":
+        processing_job["spool_dir"] = str(spool_dir)
+        await _set_ephemeral_job(job_id, processing_job)
+    maximum_bytes = int(os.getenv("V2_SPOOL_MAX_BYTES", str(1024 * 1024 * 1024)))
+
+    async def open_upstream(descriptor: RemoteAssetDescriptor):
+        if descriptor.credential_ref:
+            reference = descriptor.credential_ref
+            namespace = reference.split(".", 1)[0]
+            plugin = registry.get(namespace)
+            module = container_registry.modules.get(namespace)
+            if plugin is not None:
+                client, base = internal_client, f"/{namespace}"
+            elif module is not None:
+                client, base = forward_client, module.endpoint.rstrip("/")
+            else:
+                raise RuntimeError("credential resolver unavailable")
+            if client is None:
+                raise RuntimeError("gateway client unavailable")
+            response = await client.send(
+                client.build_request(
+                    "GET",
+                    f"{base}/v2/internal/assets/{urllib.parse.quote(reference, safe='._-')}",
+                    headers={
+                        "X-Pinchana-Internal-Token": os.getenv(
+                            "PINCHANA_INTERNAL_TOKEN", "pinchana-local-development"
+                        )
+                    },
+                ),
+                stream=True,
+            )
+            return response, None
+
+        current_url = descriptor.upstream_url
+        if not current_url:
+            raise RuntimeError("descriptor has no upstream URL")
+        headers = {
+            key: str(value)
+            for key, value in (descriptor.safe_headers or {}).items()
+            if key.lower() in {"user-agent", "referer", "accept", "accept-language"}
+        }
+        for _hop in range(5):
+            try:
+                current_url, resolved_ip = validate_upstream_url(current_url)
+            except HTTPException:
+                v2_observability.increment("ssrf_rejection", platform=module_name)
+                raise
+            hostname = urllib.parse.urlparse(current_url).hostname
+            if not hostname:
+                raise RuntimeError("upstream hostname missing")
+            client = httpx.AsyncClient(
+                transport=pinned_httpx_transport(hostname, resolved_ip),
+                timeout=httpx.Timeout(120, connect=10),
+            )
+            response = await client.send(client.build_request("GET", current_url, headers=headers), stream=True)
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response, client
+            location = response.headers.get("location")
+            await response.aclose()
+            await client.aclose()
+            if not location:
+                raise RuntimeError("upstream redirect missing location")
+            next_url = urllib.parse.urljoin(current_url, location)
+            if urllib.parse.urlparse(next_url).netloc != urllib.parse.urlparse(current_url).netloc:
+                headers.pop("Referer", None)
+                headers.pop("referer", None)
+            current_url = next_url
+        raise RuntimeError("too many upstream redirects")
+
+    try:
+        web_assets: list[WebAssetV2] = []
+        spool_files: list[str] = []
+        ticket_ids: list[str] = []
+        for descriptor in extracted.assets:
+            response, owned_client = await open_upstream(descriptor)
+            try:
+                if response.status_code in {200, 206, 416}:
+                    v2_observability.increment(
+                        f"upstream_{response.status_code}", platform=module_name
+                    )
+                if response.status_code >= 400:
+                    if descriptor.credential_ref:
+                        v2_observability.increment(
+                            "credential_resolution_failure", platform=module_name
+                        )
+                    raise RuntimeError("upstream media was unavailable")
+                actual_mime = response.headers.get("content-type") or descriptor.mime_type
+                actual_filename = normalized_filename(descriptor.filename, actual_mime)
+                resolved_descriptor = descriptor.model_copy(update={
+                    "filename": actual_filename,
+                    "mime_type": actual_mime.split(";", 1)[0].strip() if actual_mime else None,
+                })
+                destination = spool_dir / f"{descriptor.index:03d}-{actual_filename}"
+                partial = destination.with_suffix(destination.suffix + ".part")
+                written = 0
+                with partial.open("wb") as output:
+                    async for chunk in response.aiter_raw():
+                        written += len(chunk)
+                        if written > maximum_bytes:
+                            raise RuntimeError("spool asset exceeds configured size limit")
+                        output.write(chunk)
+                if written == 0:
+                    raise RuntimeError("upstream returned an empty asset")
+                partial.replace(destination)
+                spool_files.append(str(destination))
+                v2_observability.increment("spool_bytes", platform=module_name, amount=written)
+            finally:
+                await response.aclose()
+                if owned_client is not None:
+                    await owned_client.aclose()
+            ticket = await ticket_store.create_ticket(
+                session_nonce=session_nonce,
+                instance_id=instance_id,
+                descriptor=resolved_descriptor,
+                spool_path=str(destination),
+                ttl_seconds=1800,
+            )
+            ticket_ids.append(ticket.ticket_id)
+            web_assets.append(
+                WebAssetV2(
+                    id=f"{extracted.shortcode}-{descriptor.index}",
+                    asset_key=descriptor.asset_id or f"{module_name}:{extracted.shortcode}:{descriptor.index}:{descriptor.role}",
+                    index=descriptor.index,
+                    type=descriptor.media_type,
+                    role=descriptor.role,
+                    filename=resolved_descriptor.filename,
+                    mime_type=resolved_descriptor.mime_type,
+                    size=descriptor.size,
+                    dimensions=descriptor.dimensions,
+                    duration_seconds=descriptor.duration_seconds,
+                    bitrate=descriptor.bitrate,
+                    looping=descriptor.looping,
+                    delivery=WebAssetTunnelDelivery(
+                        kind="tunnel",
+                        url=f"/v2/assets/{ticket.ticket_id}",
+                        expires_at=ticket.expires_at,
+                    ),
+                )
+            )
+
+        ready_response = ScrapeV2WebReadyResponse(
+            status="ready",
+            request_id=job_id,
+            source=ScrapeSource(platform=module_name, url=url),
+            content=ScrapeV2Content(
+                shortcode=extracted.shortcode,
+                title=extracted.caption,
+                text=extracted.caption,
+            ),
+            author=ScrapeAuthor(name=extracted.author, username=extracted.author),
+            assets=web_assets,
+        )
+        ready_expiry = int(time.time()) + 1800
+        await _set_ephemeral_job(job_id, {
+            "status": "ready",
+            "result": ready_response.model_dump(mode="json"),
+            "expires_at": ready_expiry,
+            "session_nonce": session_nonce,
+            "instance_id": instance_id,
+            "platform": module_name,
+            "spool_dir": str(spool_dir),
+            "spool_files": spool_files,
+            "ticket_ids": ticket_ids,
+        })
+        asyncio.create_task(_expire_ephemeral_job(job_id, ready_expiry))
+        v2_observability.increment("processing_job_success", platform=module_name)
+        v2_observability.observe(
+            "time_to_ready", time.monotonic() - started_at, platform=module_name
+        )
+    except Exception as exc:
+        logger.error("ephemeral_spool_job_failed platform=%s error=%s", module_name, type(exc).__name__)
+        shutil.rmtree(spool_dir, ignore_errors=True)
+        await _set_ephemeral_job(job_id, {
+            "status": "failed",
+            "error": "Media processing failed",
+            "expires_at": int(time.time()) + 300,
+            "session_nonce": session_nonce,
+            "instance_id": instance_id,
+            "platform": module_name,
+            "spool_dir": None,
+            "spool_files": [],
+            "ticket_ids": [],
+        })
+        v2_observability.increment("processing_job_failure", platform=module_name)
+
+
+async def _run_ephemeral_spool_job_guarded(
+    job_id: str,
+    url: str,
+    module_name: str,
+    session_nonce: str,
+    instance_id: str,
+    extracted: ScrapeV2ExtractedData,
+) -> None:
+    try:
+        await _run_ephemeral_spool_job(
+            job_id, url, module_name, session_nonce, instance_id, extracted
+        )
+    except Exception as exc:
+        logger.error(
+            "ephemeral_spool_job_setup_failed platform=%s error=%s",
+            module_name,
+            type(exc).__name__,
+        )
+        await _set_ephemeral_job(job_id, {
+            "status": "failed",
+            "error": "Media processing could not start; retry the request",
+            "expires_at": int(time.time()) + 300,
+            "session_nonce": session_nonce,
+            "instance_id": instance_id,
+            "platform": module_name,
+            "spool_dir": None,
+            "spool_files": [],
+            "ticket_ids": [],
+        })
+        v2_observability.increment("processing_job_failure", platform=module_name)
+
+
+@app.get("/v2/jobs/{job_id}")
+async def get_v2_job_status(
+    job_id: str,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    job = await _get_ephemeral_job(job_id)
+    if not job:
+        v2_observability.increment("processing_job_404")
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    if int(job.get("expires_at", 0)) <= int(time.time()):
+        if await _cleanup_job_spool(job):
+            await _delete_ephemeral_job(job_id)
+        else:
+            asyncio.create_task(_expire_ephemeral_job(job_id, int(time.time()) + 30))
+        v2_observability.increment("processing_job_expiry", platform=job.get("platform"))
+        raise HTTPException(status_code=410, detail="Job expired")
+    if (
+        job.get("session_nonce") != claims.get("nonce", "")
+        or job.get("instance_id") != _get_instance_id(claims)
+    ):
+        v2_observability.increment("processing_job_403", platform=job.get("platform"))
+        raise HTTPException(status_code=403, detail="Job does not belong to this web session")
+    if job["status"] == "ready":
+        if not _job_spool_files_available(job):
+            await _cleanup_job_spool(job)
+            job.update({
+                "status": "failed",
+                "error": "Processed media is unavailable; retry the request",
+                "expires_at": int(time.time()) + 300,
+                "spool_dir": None,
+                "spool_files": [],
+                "ticket_ids": [],
+            })
+            await _set_ephemeral_job(job_id, job)
+            v2_observability.increment("processing_job_failure", platform=job.get("platform"))
+            raise HTTPException(status_code=502, detail=job["error"])
+        return JSONResponse(content=job["result"])
+    if job["status"] == "failed":
+        raise HTTPException(status_code=502, detail=job.get("error", "Job failed"))
+    return {
+        "status": "processing",
+        "job_id": job_id,
+        "status_url": f"/v2/jobs/{job_id}",
+        "expires_at": job.get("expires_at", int(time.time()) + 300),
+    }
+
+
+@app.post(
+    "/v2/scrape",
+    response_model=ScrapeV2WebReadyResponse | ScrapeV2WebProcessingResponse,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v2_web_scrape(
+    request: ScrapeRequest,
+    http_request: Request,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    """v2 Web resolve route returning zero-persistent-cache opaque tickets."""
+    resolve_started = time.monotonic()
+    logger.info("authenticated_v2_web_scrape")
+    url = str(request.url)
+    mode, name, target = _resolve_module(url)
+    if mode is None:
+        raise HTTPException(status_code=400, detail="No module handles this URL.")
+    v2_observability.increment("resolve_attempt", platform=str(name))
+    if not _v2_platform_enabled(str(name)):
+        logger.info("v2_route_disabled platform=%s", name)
+        v2_observability.increment("v1_rollback_disabled", platform=str(name))
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "v2_disabled", "message": f"Native v2 is disabled for {name}"},
+        )
+
+    session_nonce = claims.get("nonce", "")
+    instance_id = _get_instance_id(claims)
+
+    if internal_client is None or forward_client is None:
+        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
+    module_client = internal_client if mode == "in_process" else forward_client
+    module_base = f"/{name}" if mode == "in_process" else target.endpoint.rstrip("/")
+    try:
+        cap_resp = await module_client.get(f"{module_base}/v2/capabilities", timeout=5)
+        capabilities = cap_resp.json() if cap_resp.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("v2_capability_failed platform=%s error=%s", name, type(exc).__name__)
+        v2_observability.increment("v1_rollback_capability", platform=str(name))
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "v2_capability_unavailable", "message": f"Native v2 capability check failed for {name}"},
+        ) from exc
+    if not capabilities.get("supports_v2_remote"):
+        logger.info("v2_capability_unavailable platform=%s status=%s", name, cap_resp.status_code)
+        v2_observability.increment("v1_rollback_capability", platform=str(name))
+        raise HTTPException(
+            status_code=502,
+            detail={"code": "v2_capability_unavailable", "message": f"Native v2 is unavailable for {name}"},
+        )
+    try:
+        scrape_resp = await module_client.post(f"{module_base}/v2/scrape", json={"url": url})
+    except httpx.HTTPError as exc:
+        logger.warning("v2_extract_unreachable platform=%s error=%s", name, type(exc).__name__)
+        raise HTTPException(status_code=503, detail={"code": "service_unavailable", "message": f"The {name} scraper is unavailable"}) from exc
+    if scrape_resp.status_code != 200:
+        try:
+            upstream_detail = scrape_resp.json().get("detail")
+        except (ValueError, AttributeError):
+            upstream_detail = None
+        raise HTTPException(
+            status_code=scrape_resp.status_code,
+            detail=upstream_detail or {"code": "extraction_failed", "message": f"{name} extraction failed"},
+        )
+    try:
+        v2_extracted = ScrapeV2ExtractedData(**scrape_resp.json())
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=502, detail={"code": "invalid_response", "message": "The scraper returned an invalid v2 response"}) from exc
+    if not v2_extracted.assets:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "No downloadable media found"})
+
+    if any(not _descriptor_can_tunnel(descriptor) for descriptor in v2_extracted.assets):
+        job_id = secrets.token_urlsafe(18)
+        job_expiry = int(time.time()) + 1800
+        await _set_ephemeral_job(job_id, {
+            "status": "processing",
+            "expires_at": job_expiry,
+            "session_nonce": session_nonce,
+            "instance_id": instance_id,
+            "platform": str(name),
+            "spool_dir": None,
+            "spool_files": [],
+            "ticket_ids": [],
+        })
+        spool_task = asyncio.create_task(_run_ephemeral_spool_job_guarded(
+            job_id,
+            url,
+            str(name),
+            session_nonce,
+            instance_id,
+            v2_extracted,
+        ))
+        _track_spool_task(job_id, spool_task)
+        v2_observability.increment("delivery_spool", platform=str(name))
+        v2_observability.increment("native_v2_success", platform=str(name))
+        v2_observability.observe(
+            "resolve_latency", time.monotonic() - resolve_started, platform=str(name)
+        )
+        return ScrapeV2WebProcessingResponse(
+            status="processing",
+            request_id=str(uuid.uuid4()),
+            job_id=job_id,
+            status_url=f"/v2/jobs/{job_id}",
+            expires_at=job_expiry,
+        )
+
+    # Native v2 remote assets
+    web_assets: list[WebAssetV2] = []
+    for desc in v2_extracted.assets:
+        ttl = _descriptor_ticket_ttl(desc)
+        ticket = await ticket_store.create_ticket(
+            session_nonce=session_nonce,
+            instance_id=instance_id,
+            descriptor=desc,
+            ttl_seconds=ttl,
+        )
+        web_assets.append(
+            WebAssetV2(
+                id=f"{v2_extracted.shortcode}-{desc.index}",
+                asset_key=desc.asset_id or f"{name}:{v2_extracted.shortcode}:{desc.index}:{desc.role}",
+                index=desc.index,
+                type=desc.media_type,  # type: ignore
+                role=desc.role,  # type: ignore
+                filename=desc.filename,
+                mime_type=desc.mime_type,
+                size=desc.size,
+                dimensions=desc.dimensions,
+                duration_seconds=desc.duration_seconds,
+                bitrate=desc.bitrate,
+                looping=desc.looping,
+                delivery=WebAssetTunnelDelivery(
+                    kind="tunnel",
+                    url=f"/v2/assets/{ticket.ticket_id}",
+                    expires_at=ticket.expires_at,
+                ),
+            )
+        )
+
+    v2_observability.increment("delivery_tunnel", platform=str(name))
+    v2_observability.increment("native_v2_success", platform=str(name))
+    v2_observability.observe(
+        "resolve_latency", time.monotonic() - resolve_started, platform=str(name)
+    )
+    return ScrapeV2WebReadyResponse(
+        status="ready",
+        request_id=str(uuid.uuid4()),
+        source=ScrapeSource(platform=name, url=url),  # type: ignore[arg-type]
+        content=ScrapeV2Content(
+            shortcode=v2_extracted.shortcode,
+            title=v2_extracted.caption,
+            text=v2_extracted.caption,
+        ),
+        author=ScrapeAuthor(name=v2_extracted.author, username=v2_extracted.author),
+        assets=web_assets,
+    )
+
+
+
+@app.get("/v2/assets/{ticket_id}", operation_id="get_v2_asset")
+@app.head("/v2/assets/{ticket_id}", operation_id="head_v2_asset")
+async def serve_v2_asset(
+    ticket_id: str,
+    request: Request,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    """Stream or head request for a session-bound opaque asset ticket."""
+    ticket = await ticket_store.get_ticket(ticket_id)
+    if not ticket:
+        v2_observability.increment("ticket_404")
+        raise HTTPException(status_code=404, detail="Invalid or expired asset ticket")
+
+    if ticket.is_expired() and ticket.active_leases == 0:
+        await ticket_store.delete_ticket(ticket_id)
+        v2_observability.increment("ticket_410")
+        raise HTTPException(status_code=410, detail="Asset ticket expired")
+
+    if ticket.session_nonce != claims.get("nonce", ""):
+        v2_observability.increment("ticket_403")
+        raise HTTPException(status_code=403, detail="Ticket does not belong to this web session")
+
+    if ticket.instance_id != _get_instance_id(claims):
+        v2_observability.increment("ticket_403")
+        raise HTTPException(status_code=403, detail="Ticket is not valid for this API instance")
+
+    if request.method == "HEAD":
+        # For HEAD requests, lease is acquired and released inline
+        acquired = await ticket_store.acquire_lease(ticket_id)
+        if not acquired:
+            raise HTTPException(status_code=404, detail="Ticket expired")
+        try:
+            return await _stream_v2_asset(ticket, request)
+        finally:
+            await ticket_store.release_lease(ticket_id)
+
+    acquired = await ticket_store.acquire_lease(ticket_id)
+    if not acquired:
+        raise HTTPException(status_code=404, detail="Ticket expired")
+
+    try:
+        return await _stream_v2_asset(ticket, request)
+    except Exception:
+        await ticket_store.release_lease(ticket_id)
+        raise
+
+
+@app.post(
+    "/v2/telegram/scrape",
+    response_model=ScrapeV2TelegramResponse,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v2_telegram_scrape(
+    request: ScrapeRequest,
+    http_request: Request,
+    client_name: str = Depends(_require_telegram_scope),
+):
+    """Authenticated endpoint reserved for Telegram Bot API delivery normalization."""
+    logger.info("authenticated_v2_telegram_scrape client=%s", client_name)
+    url = str(request.url)
+    platform, payload = await _process_scrape_payload(request, http_request)
+    try:
+        normalized = await normalize_scrape_response(
+            payload,
+            platform=platform,
+            source_url=url,
+            probe=None,
+        )
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=502, detail="The scraper returned an invalid response") from exc
+
+    shortcode = normalized.data.id
+    cache_root = storage.base_path.resolve()
+    post_dir = (storage.base_path / shortcode).resolve()
+
+    # Path traversal validation for post_dir
+    try:
+        post_dir.relative_to(cache_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid post directory path traversal")
+
+    if not post_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Media post directory not found")
+
+    ordered_media = sorted(normalized.data.media, key=lambda item: item.index)
+    if not ordered_media:
+        raise HTTPException(status_code=404, detail="No source media files found in post directory")
+
+    telegram_assets: List[TelegramAssetV2] = []
+
+    for asset in ordered_media:
+        source_file = dimension_probe._resolve_media_path(asset.url)
+        if source_file is None:
+            raise HTTPException(status_code=502, detail="Scraper returned an unresolved cache path")
+        if source_file.is_symlink():
+            raise HTTPException(status_code=400, detail=f"Symlink media is not allowed: {source_file.name}")
+
+        # Path traversal & symlink validation for each source file
+        resolved_source = source_file.resolve()
+        try:
+            resolved_source.relative_to(cache_root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Path traversal detected in media file {source_file.name}")
+
+        if not resolved_source.is_file():
+            continue
+
+        asset_type = asset.type
+        mime_type = mimetypes.guess_type(source_file.name)[0] or (
+            "video/mp4" if asset_type == "video"
+            else "audio/mpeg" if asset_type == "audio"
+            else "image/jpeg"
+        )
+        asset_key = f"{platform}:{shortcode}:{asset.index}:{asset.role}"
+        source_fingerprint = telegram_normalizer.source_fingerprint(resolved_source, asset_key)
+        cache_key = f"{asset_key}:telegram-v1:{source_fingerprint}"
+
+        if asset_type == "video":
+            variant_path, status_str, probe = await telegram_normalizer.normalize_for_telegram(
+                input_path=resolved_source,
+                post_dir=post_dir,
+                asset_key=asset_key,
+                fingerprint=source_fingerprint,
+                redis_client=normalization_redis,
+            )
+            rel_variant = str(variant_path.resolve().relative_to(cache_root))
+            dimensions = {"width": probe.width, "height": probe.height} if probe.width and probe.height else None
+            duration = probe.duration
+            output_size = variant_path.stat().st_size if variant_path.is_file() else resolved_source.stat().st_size
+        else:
+            # Images or Audio - served directly from shared cache
+            rel_variant = str(resolved_source.relative_to(cache_root))
+            status_str = "compatible"
+            probed_dimensions = await dimension_probe.dimensions_for(asset.url, asset_type)
+            dimensions = probed_dimensions.model_dump() if probed_dimensions else None
+            duration = asset.duration_seconds
+            output_size = resolved_source.stat().st_size
+
+        delivery = TelegramAssetDelivery(
+            kind="shared-cache",
+            normalization_profile="telegram-v1",
+            relative_variant_path=rel_variant,
+            asset_key=asset_key,
+            source_fingerprint=source_fingerprint,
+            cache_key=cache_key,
+            streamability_status=status_str,
+        )
+
+        telegram_assets.append(
+            TelegramAssetV2(
+                id=f"{shortcode}-{asset.index}",
+                asset_key=asset_key,
+                index=asset.index,
+                type=asset_type,  # type: ignore
+                role=asset.role,  # type: ignore[arg-type]
+                filename=Path(rel_variant).name,
+                mime_type=mime_type,
+                size=output_size,
+                dimensions=dimensions,
+                duration_seconds=duration,
+                title=asset.title,
+                artist=asset.artist,
+                looping=asset.looping,
+                delivery=delivery,
+            )
+        )
+
+    return ScrapeV2TelegramResponse(
+        status="ready",
+        request_id=str(uuid.uuid4()),
+        source={"platform": platform, "url": url},
+        content={
+            "shortcode": shortcode,
+            "caption": normalized.data.content.text,
+            "title": normalized.data.content.title,
+            "text": normalized.data.content.text,
+            "html": normalized.data.content.html,
+            "published_at": normalized.data.content.published_at,
+        },
+        author=normalized.data.author.model_dump(mode="json"),
+        engagement=normalized.data.engagement.model_dump(mode="json") if normalized.data.engagement else None,
+        safety=normalized.data.safety.model_dump(mode="json") if normalized.data.safety else None,
+        link=normalized.data.link.model_dump(mode="json") if normalized.data.link else None,
+        assets=telegram_assets,
+    )
+
 
 
 @app.post("/web/verify", response_model=WebSessionResponse)
@@ -1239,3 +2398,9 @@ async def admin_list_modules(_client_name: str = Depends(_require_api_key)):
                 result["containers"][name]["running"] = True
 
     return result
+
+
+@app.get("/admin/v2/metrics")
+async def admin_v2_metrics(_client_name: str = Depends(_require_api_key)):
+    """Return safe low-cardinality counters for the staged v2 rollout."""
+    return v2_observability.snapshot()
