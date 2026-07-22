@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import secrets
 import shutil
 import subprocess
 import time
@@ -14,7 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Set
 
+from .distributed_lock import RedisOwnedLock
 from .mp4_atom import inspect_mp4_atoms
+from .v2_observability import v2_observability
 
 logger = logging.getLogger(__name__)
 
@@ -247,13 +248,13 @@ class TelegramNormalizer:
 
         # Distributed lock with ownership token
         lock_key = f"pinchana:norm_lock:{asset_key}:telegram-v1"
-        lock_token = secrets.token_hex(16)
+        redis_lock = RedisOwnedLock(redis_client, lock_key) if redis_client else None
         got_lock = False
         renew_task = None
 
         if redis_client:
             # Token-based SETNX lock with 60s TTL
-            got_lock = await redis_client.set(lock_key, lock_token, nx=True, ex=60)
+            got_lock = await redis_lock.acquire()
             if not got_lock:
                 for _ in range(30):
                     await asyncio.sleep(1.0)
@@ -268,13 +269,10 @@ class TelegramNormalizer:
                 try:
                     while True:
                         await asyncio.sleep(10)
-                        lua_renew = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
                         try:
-                            await redis_client.eval(lua_renew, 1, lock_key, lock_token, 60)
+                            await redis_lock.renew()
                         except Exception:
-                            val = await redis_client.get(lock_key)
-                            if val == lock_token:
-                                await redis_client.expire(lock_key, 60)
+                            pass
                 except asyncio.CancelledError:
                     pass
 
@@ -300,14 +298,11 @@ class TelegramNormalizer:
             finally:
                 if renew_task:
                     renew_task.cancel()
-                if redis_client and got_lock:
-                    lua_release = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+                if redis_lock and got_lock:
                     try:
-                        await redis_client.eval(lua_release, 1, lock_key, lock_token)
+                        await redis_lock.release()
                     except Exception:
-                        val = await redis_client.get(lock_key)
-                        if val == lock_token:
-                            await redis_client.delete(lock_key)
+                        pass
 
     async def _execute_ffmpeg_normalization(
         self,
@@ -379,7 +374,8 @@ class TelegramNormalizer:
             else:
                 self._in_process_backoff[backoff_key] = time.time() + 300.0
 
-            logger.exception("telegram_normalization_error asset=%s: %s", final_variant_path.name, exc)
+            logger.error("telegram_normalization_failed error=%s", type(exc).__name__)
+            v2_observability.increment("normalization_failure")
             raise
 
     @staticmethod

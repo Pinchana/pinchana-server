@@ -52,7 +52,12 @@ from .ssrf import pinned_httpx_transport, validate_upstream_url
 from .tickets import InMemoryTicketStore, RedisTicketStore, TicketData, TicketStore
 from .telegram_normalizer import TelegramNormalizer
 from .v2_observability import v2_observability
-from .v2_runtime import normalized_filename, validate_internal_token, validate_spool_topology
+from .v2_runtime import (
+    normalized_filename,
+    validate_internal_token,
+    validate_shared_spool_registry,
+    validate_spool_topology,
+)
 from .schemas import (
     ApiErrorResponse,
     MediaDimensions,
@@ -326,6 +331,58 @@ def _configured_api_keys() -> dict[str, str]:
     return keys
 
 
+def _configured_metrics_token() -> str:
+    configured = os.getenv("PINCHANA_METRICS_TOKEN", "")
+    token_file = os.getenv("PINCHANA_METRICS_TOKEN_FILE", "").strip()
+    if token_file:
+        try:
+            configured = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError("Metrics authentication is not configured") from exc
+    lowered = configured.lower()
+    if len(configured) < 32 or "replace-with" in lowered or "change-me" in lowered:
+        raise RuntimeError("Metrics authentication is not configured")
+    return configured
+
+
+def _validate_gateway_startup() -> None:
+    environment = os.getenv("PINCHANA_ENV", os.getenv("ENVIRONMENT", "development")).lower()
+    if environment not in {"production", "prod", "staging"}:
+        return
+    keys = _configured_api_keys()
+    if any(
+        len(value) < 32 or "replace-with" in value.lower() or "change-me" in value.lower()
+        for value in keys.values()
+    ):
+        raise RuntimeError("Production API keys must be strong non-placeholder secrets")
+    raw_scopes = os.getenv("PINCHANA_API_KEY_SCOPES", "")
+    if raw_scopes:
+        try:
+            scopes = json.loads(raw_scopes)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("API scope configuration is invalid") from exc
+        if not isinstance(scopes, dict) or any(name not in keys for name in scopes):
+            raise RuntimeError("API scope configuration is invalid")
+        if any(
+            not (
+                isinstance(value, str)
+                or (isinstance(value, list) and all(isinstance(item, str) for item in value))
+            )
+            for value in scopes.values()
+        ):
+            raise RuntimeError("API scope configuration is invalid")
+    if len(os.getenv("TURNSTILE_SESSION_SECRET", "")) < 32:
+        raise RuntimeError("TURNSTILE_SESSION_SECRET must contain at least 32 characters")
+    if not os.getenv("TURNSTILE_SECRET_KEY", "").strip():
+        raise RuntimeError("TURNSTILE_SECRET_KEY is required")
+    _configured_metrics_token()
+    if _dlp_enabled():
+        try:
+            _dlp_config()
+        except HTTPException as exc:
+            raise RuntimeError("DLP secrets are invalid") from exc
+
+
 def _require_api_key(x_api_key: str | None = Header(default=None)) -> str:
     try:
         keys = _configured_api_keys()
@@ -335,6 +392,16 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> str:
         if x_api_key and hmac.compare_digest(x_api_key, candidate):
             return client_name
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _require_metrics_token(authorization: str | None = Header(default=None)) -> None:
+    try:
+        configured = _configured_metrics_token()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="Metrics authentication is not configured")
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(supplied, configured):
+        raise HTTPException(status_code=401, detail="Invalid or missing metrics credential")
 
 
 def _require_telegram_scope(
@@ -514,7 +581,7 @@ async def _dlp_json(method: str, path: str, claims: dict[str, Any], body: dict[s
             timeout=httpx.Timeout(30, connect=5),
         )
     except httpx.RequestError as exc:
-        logger.warning("dlp_upstream_unavailable path=%s error=%s", path, type(exc).__name__)
+        logger.warning("dlp_upstream_unavailable error=%s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Private downloads are temporarily unavailable") from exc
     if response.status_code >= 400:
         try:
@@ -553,12 +620,19 @@ def _valid_turnstile_result(result: Any, *, enforce_metadata: bool = True) -> bo
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global forward_client, internal_client, ticket_store, normalization_redis
-    validate_spool_topology()
+    _validate_gateway_startup()
+    spool_status = validate_spool_topology()
     validate_internal_token()
     redis_url = os.getenv("REDIS_URL", "").strip()
     if redis_url:
         ticket_store = RedisTicketStore(redis_url)
         normalization_redis = ticket_store.redis
+        try:
+            await normalization_redis.ping()
+            await validate_shared_spool_registry(normalization_redis, spool_status)
+        except Exception as exc:
+            await normalization_redis.aclose()
+            raise RuntimeError("Redis or shared spool validation failed") from exc
     else:
         ticket_store = InMemoryTicketStore(check_workers=True)
         normalization_redis = None
@@ -684,9 +758,9 @@ async def api_validation_exception_handler(request: Request, exc: RequestValidat
 @app.exception_handler(Exception)
 async def api_unhandled_exception_handler(request: Request, exc: Exception):
     if not _is_v1_request(request):
-        logger.exception("unhandled_request_error path=%s", request.url.path, exc_info=exc)
+        logger.error("unhandled_request_error api=v2 error=%s", type(exc).__name__)
         return PlainTextResponse(status_code=500, content="Internal Server Error")
-    logger.exception("v1_unhandled_request_error path=%s", request.url.path, exc_info=exc)
+    logger.error("unhandled_request_error api=v1 error=%s", type(exc).__name__)
     return JSONResponse(
         status_code=500,
         content={
@@ -759,25 +833,33 @@ def _descriptor_can_tunnel(descriptor: RemoteAssetDescriptor) -> bool:
     return _descriptor_ticket_ttl(descriptor) >= V2_MIN_DIRECT_TTL_SECONDS
 
 
+def _ticket_platform(ticket: TicketData) -> str:
+    asset_id = ticket.descriptor.asset_id or ""
+    platform = asset_id.split(":", 1)[0].lower()
+    return platform if platform in V2_PLATFORM_FLAGS else "unknown"
+
+
+async def _release_ticket_lease(ticket: TicketData) -> None:
+    await ticket_store.release_lease(ticket.ticket_id)
+    v2_observability.increment("active_lease_released", platform=_ticket_platform(ticket))
+
+
 async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dict[str, Any]:
     module = container_registry.modules.get(module_name)
     if not module:
         raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
 
-    endpoint = module.endpoint
     if forward_client is None:
         raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
-    logger.info(
-        "scrape_forward module=%s endpoint=%s url=%s",
-        module_name, endpoint, request.url,
-    )
+    endpoint = module.endpoint
+    logger.info("scrape_forward module=%s", module_name)
     try:
         resp = await forward_client.post(
             f"{endpoint}/scrape",
             json={"url": str(request.url)},
         )
     except httpx.RequestError as exc:
-        logger.error("Upstream module %s (%s) is unreachable: %s", module_name, endpoint, exc)
+        logger.error("scrape_upstream_unreachable module=%s error=%s", module_name, type(exc).__name__)
         raise HTTPException(
             status_code=503,
             detail=f"The {module_name} scraper is temporarily unavailable",
@@ -785,10 +867,7 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dic
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        logger.error(
-            "Upstream module %s (%s) returned %s for /scrape: %s",
-            module_name, endpoint, resp.status_code, resp.text,
-        )
+        logger.error("scrape_upstream_error module=%s status=%s", module_name, resp.status_code)
         raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
     payload = resp.json()
     if not isinstance(payload, dict):
@@ -813,9 +892,7 @@ async def _process_scrape_payload(
 ) -> tuple[str, dict[str, Any]]:
     """Route a scrape and retain the complete module payload for v1 adapters."""
     url = str(request.url)
-    client = http_request.client
-    client_address = f"{client.host}:{client.port}" if client else "unknown"
-    logger.info("scrape_request client=%s url=%s", client_address, url)
+    logger.info("scrape_request")
 
     mode, name, target = _resolve_module(url)
 
@@ -829,9 +906,7 @@ async def _process_scrape_payload(
             for module_name, module in container_registry.modules.items()
         }
         logger.warning(
-            "scrape_rejected reason=no_matching_module client=%s url=%s "
-            "plugin_patterns=%s container_patterns=%s",
-            client_address, url, plugin_patterns, container_patterns,
+            "scrape_rejected reason=no_matching_module"
         )
         raise HTTPException(
             status_code=400,
@@ -840,20 +915,14 @@ async def _process_scrape_payload(
                    f"Containers: {container_patterns}"
         )
 
-    logger.info(
-        "scrape_route_selected client=%s url=%s module=%s mode=%s patterns=%s",
-        client_address, url, name, mode, target.route_patterns,
-    )
+    logger.info("scrape_route_selected module=%s mode=%s", name, mode)
     started = time.perf_counter()
     if mode == "in_process":
         if internal_client is None:
             raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
         resp = await internal_client.post(f"/{name}/scrape", json={"url": url})
         if resp.status_code != 200:
-            logger.error(
-                "scrape_upstream_error module=%s mode=%s status=%s body=%s",
-                name, mode, resp.status_code, resp.text,
-            )
+            logger.error("scrape_upstream_error module=%s mode=%s status=%s", name, mode, resp.status_code)
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         payload = resp.json()
         if not isinstance(payload, dict):
@@ -1114,7 +1183,7 @@ async def _stream_credential_asset(ticket: TicketData, request: Request):
                     yield chunk
             finally:
                 await response.aclose()
-                await ticket_store.release_lease(ticket.ticket_id)
+                await _release_ticket_lease(ticket)
 
         return StreamingResponse(
             dlp_body(), status_code=response.status_code, headers=output_headers
@@ -1177,7 +1246,7 @@ async def _stream_credential_asset(ticket: TicketData, request: Request):
                 yield chunk
         finally:
             await response.aclose()
-            await ticket_store.release_lease(ticket.ticket_id)
+            await _release_ticket_lease(ticket)
 
     return StreamingResponse(body(), status_code=response.status_code, headers=output_headers)
 
@@ -1196,7 +1265,7 @@ async def _stream_v2_asset(ticket: TicketData, request: Request):
                 "X-Content-Type-Options": "nosniff",
             },
             background=(
-                BackgroundTask(ticket_store.release_lease, ticket.ticket_id)
+                BackgroundTask(_release_ticket_lease, ticket)
                 if request.method != "HEAD"
                 else None
             ),
@@ -1301,7 +1370,7 @@ async def _stream_v2_asset(ticket: TicketData, request: Request):
             finally:
                 await resp.aclose()
                 await pinned_client.aclose()
-                await ticket_store.release_lease(ticket.ticket_id)
+                await _release_ticket_lease(ticket)
 
         return StreamingResponse(
             _body_stream(),
@@ -2016,6 +2085,7 @@ async def _start_v2_dlp_job(
         "spool_files": [],
         "ticket_ids": [],
     })
+    v2_observability.increment("processing_job_started", platform=platform)
     v2_observability.increment("delivery_dlp", platform=platform)
     return ScrapeV2WebProcessingResponse(
         status="processing",
@@ -2175,6 +2245,7 @@ async def process_v2_web_scrape(
             v2_extracted,
         ))
         _track_spool_task(job_id, spool_task)
+        v2_observability.increment("processing_job_started", platform=str(name))
         v2_observability.increment("delivery_spool", platform=str(name))
         v2_observability.increment("native_v2_success", platform=str(name))
         v2_observability.observe(
@@ -2269,19 +2340,21 @@ async def serve_v2_asset(
         acquired = await ticket_store.acquire_lease(ticket_id)
         if not acquired:
             raise HTTPException(status_code=404, detail="Ticket expired")
+        v2_observability.increment("active_lease_acquired", platform=_ticket_platform(ticket))
         try:
             return await _stream_v2_asset(ticket, request)
         finally:
-            await ticket_store.release_lease(ticket_id)
+            await _release_ticket_lease(ticket)
 
     acquired = await ticket_store.acquire_lease(ticket_id)
     if not acquired:
         raise HTTPException(status_code=404, detail="Ticket expired")
+    v2_observability.increment("active_lease_acquired", platform=_ticket_platform(ticket))
 
     try:
         return await _stream_v2_asset(ticket, request)
     except Exception:
-        await ticket_store.release_lease(ticket_id)
+        await _release_ticket_lease(ticket)
         raise
 
 
@@ -3027,6 +3100,102 @@ async def health_check():
     return {"status": "healthy", "modules": results}
 
 
+@app.get("/livez")
+async def liveness_check():
+    """Process liveness only; no network or storage dependencies."""
+    return {"status": "alive", "service": "server"}
+
+
+async def _enabled_module_readiness(name: str) -> dict[str, Any]:
+    plugin = registry.get(name)
+    module = container_registry.modules.get(name)
+    if plugin is not None:
+        client, base = internal_client, f"/{name}"
+    elif module is not None:
+        client, base = forward_client, module.endpoint.rstrip("/")
+    else:
+        return {"status": "not-ready", "reason": "not-configured"}
+    if client is None:
+        return {"status": "not-ready", "reason": "gateway-client"}
+    try:
+        capability = await client.get(f"{base}/v2/capabilities", timeout=5)
+        if capability.status_code != 200 or not capability.json().get("supports_v2_remote"):
+            return {"status": "not-ready", "reason": "capability"}
+        probe_path = "/readyz" if name in {"soundcloud", "tiktok"} else "/health"
+        health = await client.get(f"{base}{probe_path}", timeout=5)
+        if health.status_code != 200:
+            return {"status": "not-ready", "reason": "dependency"}
+        detail = health.json()
+        if name == "spotify" and detail.get("spotify_api") is not True:
+            return {"status": "not-ready", "reason": "credentials"}
+        if name in {"soundcloud", "tiktok"}:
+            resolver = await client.get(
+                f"{base}/v2/internal/readiness",
+                headers={"X-Pinchana-Internal-Token": os.getenv("PINCHANA_INTERNAL_TOKEN", "")},
+                timeout=5,
+            )
+            if resolver.status_code != 204:
+                v2_observability.increment("credential_resolution_failure", platform=name)
+                return {"status": "not-ready", "reason": "credential-agreement"}
+        return {"status": "ready"}
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return {"status": "not-ready", "reason": "unreachable"}
+
+
+@app.get("/readyz")
+async def readiness_check():
+    """Feature-aware readiness with bounded, non-secret dependency details."""
+    dependencies: dict[str, Any] = {}
+    ready = True
+    redis_required = bool(os.getenv("REDIS_URL", "").strip()) or any(
+        _v2_platform_enabled(name) for name in {"soundcloud"}
+    ) or int(os.getenv("PINCHANA_API_REPLICAS", "1")) > 1
+    if normalization_redis is None:
+        dependencies["redis"] = "not-configured" if redis_required else "optional"
+        ready = ready and not redis_required
+        v2_observability.set_gauge("redis_ready", 0 if redis_required else 1)
+    else:
+        try:
+            dependencies["redis"] = "ready" if await normalization_redis.ping() else "not-ready"
+        except Exception:
+            dependencies["redis"] = "not-ready"
+            v2_observability.increment("redis_failure")
+        ready = ready and dependencies["redis"] == "ready"
+        v2_observability.set_gauge("redis_ready", 1 if dependencies["redis"] == "ready" else 0)
+    try:
+        spool_status = validate_spool_topology()
+        if normalization_redis is not None:
+            await validate_shared_spool_registry(normalization_redis, spool_status)
+        dependencies["spool"] = "ready" if spool_status.get("configured") else "optional"
+        if spool_status.get("configured"):
+            usage = shutil.disk_usage(_spool_root())
+            v2_observability.set_gauge("spool_free_bytes", usage.free)
+            v2_observability.set_gauge("spool_used_bytes", usage.used)
+    except Exception:
+        dependencies["spool"] = "not-ready"
+        ready = False
+        v2_observability.increment("shared_spool_failure")
+    enabled_platforms = [name for name in V2_PLATFORM_FLAGS if _v2_platform_enabled(name)]
+    modules: dict[str, Any] = {}
+    for name in enabled_platforms:
+        modules[name] = await _enabled_module_readiness(name)
+        ready = ready and modules[name]["status"] == "ready"
+    if _v2_platform_enabled("ytmusic") or _dlp_enabled():
+        dlp_ready = await _dlp_healthy()
+        dependencies["dlp"] = "ready" if dlp_ready else "not-ready"
+        ready = ready and dlp_ready
+    else:
+        dependencies["dlp"] = "optional"
+    payload = {
+        "status": "ready" if ready else "not-ready",
+        "dependencies": dependencies,
+        "enabled_platforms": modules,
+    }
+    if not ready:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Admin routes for VPN management
 # ---------------------------------------------------------------------------
@@ -3108,3 +3277,9 @@ async def admin_list_modules(_client_name: str = Depends(_require_api_key)):
 async def admin_v2_metrics(_client_name: str = Depends(_require_api_key)):
     """Return safe low-cardinality counters for the staged v2 rollout."""
     return v2_observability.snapshot()
+
+
+@app.get("/admin/v2/metrics/prometheus", response_class=PlainTextResponse)
+async def prometheus_v2_metrics(_authorized: None = Depends(_require_metrics_token)):
+    """Authenticated Prometheus exposition for replica-level collector scraping."""
+    return PlainTextResponse(v2_observability.prometheus(), media_type="text/plain; version=0.0.4")

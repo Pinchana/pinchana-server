@@ -75,7 +75,7 @@ class MediaDimensionProbe:
                 width, height = image.size
             return MediaDimensions(width=width, height=height)
         except (OSError, ValueError):
-            logger.warning("media_dimension_probe_failed type=image path=%s", path)
+            logger.warning("media_dimension_probe_failed type=image")
             return None
 
     @staticmethod
@@ -120,7 +120,7 @@ class MediaDimensionProbe:
             logger.warning("media_dimension_probe_unavailable executable=ffprobe")
             return None
         except (OSError, subprocess.TimeoutExpired):
-            logger.warning("media_dimension_probe_failed type=video path=%s", path)
+            logger.warning("media_dimension_probe_failed type=video")
             return None
         if process.returncode != 0:
             logger.warning(
@@ -139,5 +139,5 @@ class MediaDimensionProbe:
                 width, height = height, width
             return MediaDimensions(width=width, height=height)
         except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("media_dimension_probe_invalid type=video path=%s", path)
+            logger.warning("media_dimension_probe_invalid type=video")
             return None
