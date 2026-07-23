@@ -897,7 +897,15 @@ async def web_verify(
 ):
     """Validate a one-use Turnstile token or mobile client key and issue a signed web session."""
     mobile_secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
-    if mobile_secret:
+    is_mobile_request = request.token.startswith("mobile:") or x_mobile_key is not None
+
+    if is_mobile_request:
+        if not mobile_secret:
+            logger.warning("mobile_verification_failed reason=PINCHANA_MOBILE_APP_KEY_not_set_on_server")
+            raise HTTPException(
+                status_code=403,
+                detail="Mobile app verification is not configured on server (PINCHANA_MOBILE_APP_KEY missing)",
+            )
         is_mobile_token = (
             hmac.compare_digest(request.token, f"mobile:{mobile_secret}")
             or hmac.compare_digest(request.token, mobile_secret)
@@ -907,6 +915,8 @@ async def web_verify(
             logger.info("mobile_app_verification_accepted")
             access_token, expires_at = _issue_web_session()
             return WebSessionResponse(access_token=access_token, expires_at=expires_at)
+        logger.warning("mobile_verification_failed reason=key_mismatch")
+        raise HTTPException(status_code=403, detail="Invalid mobile app key")
 
     secret_key = os.getenv("TURNSTILE_SECRET_KEY", "")
     if not secret_key or forward_client is None:
