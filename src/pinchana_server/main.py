@@ -890,13 +890,32 @@ async def process_v1_web_scrape_request(
     return ScrapeV1Response.model_validate(rewritten)
 
 
+def _mobile_app_secret() -> str:
+    secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
+    if secret:
+        return secret
+    secret = os.getenv("PINCHANA_MOBILE_KEY", "").strip()
+    if secret:
+        return secret
+    secret = os.getenv("MOBILE_APP_KEY", "").strip()
+    if secret:
+        return secret
+    try:
+        keys = _configured_api_keys()
+        if isinstance(keys, dict) and "mobile" in keys:
+            return str(keys["mobile"]).strip()
+    except Exception:
+        pass
+    return ""
+
+
 @app.post("/web/verify", response_model=WebSessionResponse)
 async def web_verify(
     request: WebVerifyRequest,
     x_mobile_key: str | None = Header(default=None),
 ):
     """Validate a one-use Turnstile token or mobile client key and issue a signed web session."""
-    mobile_secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
+    mobile_secret = _mobile_app_secret()
     is_mobile_header = isinstance(x_mobile_key, str) and bool(x_mobile_key)
     is_mobile_request = request.token.startswith("mobile:") or is_mobile_header
 
