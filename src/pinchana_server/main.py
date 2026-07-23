@@ -891,8 +891,20 @@ async def process_v1_web_scrape_request(
 
 
 @app.post("/web/verify", response_model=WebSessionResponse)
-async def web_verify(request: WebVerifyRequest):
-    """Validate a one-use Turnstile token and issue a signed web session."""
+async def web_verify(
+    request: WebVerifyRequest,
+    x_mobile_key: str | None = Header(default=None),
+):
+    """Validate a one-use Turnstile token or mobile client key and issue a signed web session."""
+    mobile_secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
+    if mobile_secret:
+        is_mobile_token = request.token == f"mobile:{mobile_secret}" or request.token == mobile_secret
+        is_mobile_header = x_mobile_key is not None and hmac.compare_digest(x_mobile_key, mobile_secret)
+        if is_mobile_token or is_mobile_header:
+            logger.info("mobile_app_verification_accepted")
+            access_token, expires_at = _issue_web_session()
+            return WebSessionResponse(access_token=access_token, expires_at=expires_at)
+
     secret_key = os.getenv("TURNSTILE_SECRET_KEY", "")
     if not secret_key or forward_client is None:
         raise HTTPException(status_code=503, detail="Web verification is not configured")
