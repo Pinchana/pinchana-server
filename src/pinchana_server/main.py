@@ -897,7 +897,8 @@ async def web_verify(
 ):
     """Validate a one-use Turnstile token or mobile client key and issue a signed web session."""
     mobile_secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
-    is_mobile_request = request.token.startswith("mobile:") or x_mobile_key is not None
+    is_mobile_header = isinstance(x_mobile_key, str) and bool(x_mobile_key)
+    is_mobile_request = request.token.startswith("mobile:") or is_mobile_header
 
     if is_mobile_request:
         if not mobile_secret:
@@ -910,8 +911,8 @@ async def web_verify(
             hmac.compare_digest(request.token, f"mobile:{mobile_secret}")
             or hmac.compare_digest(request.token, mobile_secret)
         )
-        is_mobile_header = x_mobile_key is not None and hmac.compare_digest(x_mobile_key, mobile_secret)
-        if is_mobile_token or is_mobile_header:
+        is_mobile_key_valid = is_mobile_header and hmac.compare_digest(x_mobile_key, mobile_secret)
+        if is_mobile_token or is_mobile_key_valid:
             logger.info("mobile_app_verification_accepted")
             access_token, expires_at = _issue_web_session()
             return WebSessionResponse(access_token=access_token, expires_at=expires_at)

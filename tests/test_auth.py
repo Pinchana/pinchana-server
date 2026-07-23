@@ -166,6 +166,44 @@ class GatewayAuthTests(unittest.TestCase):
         self.assertEqual(call.kwargs["data"]["secret"], "private-secret")
         self.assertEqual(call.kwargs["data"]["response"], "browser-token")
 
+    def test_mobile_verify_valid_token(self):
+        environment = {
+            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+        }
+        with patch.dict(os.environ, environment):
+            session = asyncio.run(web_verify(WebVerifyRequest(token="mobile:my-mobile-secret-key")))
+        self.assertTrue(session.access_token)
+
+    def test_mobile_verify_valid_header(self):
+        environment = {
+            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+        }
+        with patch.dict(os.environ, environment):
+            session = asyncio.run(web_verify(WebVerifyRequest(token="mobile:default"), x_mobile_key="my-mobile-secret-key"))
+        self.assertTrue(session.access_token)
+
+    def test_mobile_verify_invalid_key_raises_403(self):
+        environment = {
+            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+        }
+        with patch.dict(os.environ, environment):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(web_verify(WebVerifyRequest(token="mobile:wrong-key")))
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_mobile_verify_missing_server_secret_raises_403(self):
+        environment = {
+            "PINCHANA_MOBILE_APP_KEY": "",
+            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+        }
+        with patch.dict(os.environ, environment):
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(web_verify(WebVerifyRequest(token="mobile:some-key")))
+        self.assertEqual(raised.exception.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()
