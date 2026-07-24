@@ -16,6 +16,7 @@ from pinchana_server.main import (
     _turnstile_rejection_reason,
     _valid_turnstile_result,
     _validate_web_session,
+    mobile_verify,
     web_identity,
     web_verify,
 )
@@ -168,41 +169,41 @@ class GatewayAuthTests(unittest.TestCase):
 
     def test_mobile_verify_valid_token(self):
         environment = {
-            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
             "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
         }
         with patch.dict(os.environ, environment):
-            session = asyncio.run(web_verify(WebVerifyRequest(token="mobile:my-mobile-secret-key")))
+            session = asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:my-mobile-secret-key")))
         self.assertTrue(session.access_token)
 
     def test_mobile_verify_valid_header(self):
         environment = {
-            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
             "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
         }
         with patch.dict(os.environ, environment):
-            session = asyncio.run(web_verify(WebVerifyRequest(token="mobile:default"), x_mobile_key="my-mobile-secret-key"))
+            session = asyncio.run(mobile_verify(WebVerifyRequest(token="default"), x_mobile_key="my-mobile-secret-key"))
         self.assertTrue(session.access_token)
 
-    def test_mobile_verify_invalid_key_raises_403(self):
+    def test_mobile_verify_invalid_key_raises_401(self):
         environment = {
-            "PINCHANA_MOBILE_APP_KEY": "my-mobile-secret-key",
+            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
             "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
         }
         with patch.dict(os.environ, environment):
             with self.assertRaises(HTTPException) as raised:
-                asyncio.run(web_verify(WebVerifyRequest(token="mobile:wrong-key")))
-        self.assertEqual(raised.exception.status_code, 403)
+                asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:wrong-key")))
+        self.assertEqual(raised.exception.status_code, 401)
 
-    def test_mobile_verify_missing_server_secret_raises_403(self):
+    def test_mobile_verify_missing_server_secret_raises_503(self):
         environment = {
-            "PINCHANA_MOBILE_APP_KEY": "",
+            "PINCHANA_API_KEYS": json.dumps({}),
             "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
         }
         with patch.dict(os.environ, environment):
             with self.assertRaises(HTTPException) as raised:
-                asyncio.run(web_verify(WebVerifyRequest(token="mobile:some-key")))
-        self.assertEqual(raised.exception.status_code, 403)
+                asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:some-key")))
+        self.assertEqual(raised.exception.status_code, 503)
 
 
 if __name__ == "__main__":

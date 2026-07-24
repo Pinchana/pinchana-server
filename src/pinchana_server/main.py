@@ -890,54 +890,91 @@ async def process_v1_web_scrape_request(
     return ScrapeV1Response.model_validate(rewritten)
 
 
-def _mobile_app_secret() -> str:
-    secret = os.getenv("PINCHANA_MOBILE_APP_KEY", "").strip()
-    if secret:
-        return secret
-    secret = os.getenv("PINCHANA_MOBILE_KEY", "").strip()
-    if secret:
-        return secret
-    secret = os.getenv("MOBILE_APP_KEY", "").strip()
-    if secret:
-        return secret
+@app.post(
+    "/v1/mobile/scrape",
+    response_model=ScrapeV1Response,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v1_mobile_scrape_request(
+    request: ScrapeRequest,
+    http_request: Request,
+    _claims: dict[str, Any] = Depends(_require_web_session),
+):
+    """Return a normalized scrape response protected by a mobile session."""
+    logger.info("authenticated_v1_mobile_scrape")
+    result = await _normalized_scrape_response(request, http_request)
+    rewritten = _rewrite_media_urls(result.model_dump(), "/web/media")
+    return ScrapeV1Response.model_validate(rewritten)
+
+
+def _mobile_api_key() -> str | None:
     try:
         keys = _configured_api_keys()
         if isinstance(keys, dict) and "mobile" in keys:
-            return str(keys["mobile"]).strip()
+            val = str(keys["mobile"]).strip()
+            return val if val else None
     except Exception:
         pass
-    return ""
+    return None
+
+
+@app.post("/v1/mobile/verify", response_model=WebSessionResponse)
+async def mobile_verify(
+    request: WebVerifyRequest,
+    x_api_key: str | None = Header(default=None),
+    x_mobile_key: str | None = Header(default=None),
+):
+    """Validate explicit mobile API key from PINCHANA_API_KEYS['mobile'] and issue a signed session."""
+    expected_key = _mobile_api_key()
+    if not expected_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Mobile API key is not configured in PINCHANA_API_KEYS",
+        )
+
+    candidate_key: str | None = None
+    if isinstance(x_api_key, str) and x_api_key:
+        candidate_key = x_api_key
+    elif isinstance(x_mobile_key, str) and x_mobile_key:
+        candidate_key = x_mobile_key
+    elif request.token.startswith("mobile:"):
+        candidate_key = request.token.partition("mobile:")[2]
+    elif request.token.startswith("key:"):
+        candidate_key = request.token.partition("key:")[2]
+    else:
+        candidate_key = request.token
+
+    if not candidate_key or not hmac.compare_digest(candidate_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid mobile API key")
+
+    logger.info("mobile_verification_accepted")
+    access_token, expires_at = _issue_web_session()
+    return WebSessionResponse(access_token=access_token, expires_at=expires_at)
+
+
+@app.get("/v1/mobile/session")
+async def mobile_session(claims: dict[str, Any] = Depends(_require_web_session)):
+    return {"valid": True, "expires_at": claims["exp"]}
+
+
+@app.get("/v1/mobile/capabilities")
+async def mobile_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
+    capabilities = await _dlp_capabilities() if _dlp_enabled() else None
+    available = capabilities is not None
+    return JSONResponse(
+        content={
+            "available": available,
+            "dlp": capabilities if available else None,
+        }
+    )
 
 
 @app.post("/web/verify", response_model=WebSessionResponse)
-async def web_verify(
-    request: WebVerifyRequest,
-    x_mobile_key: str | None = Header(default=None),
-):
-    """Validate a one-use Turnstile token or mobile client key and issue a signed web session."""
-    mobile_secret = _mobile_app_secret()
-    is_mobile_header = isinstance(x_mobile_key, str) and bool(x_mobile_key)
-    is_mobile_request = request.token.startswith("mobile:") or is_mobile_header
-
-    if is_mobile_request:
-        if not mobile_secret:
-            logger.warning("mobile_verification_failed reason=PINCHANA_MOBILE_APP_KEY_not_set_on_server")
-            raise HTTPException(
-                status_code=403,
-                detail="Mobile app verification is not configured on server (PINCHANA_MOBILE_APP_KEY missing)",
-            )
-        is_mobile_token = (
-            hmac.compare_digest(request.token, f"mobile:{mobile_secret}")
-            or hmac.compare_digest(request.token, mobile_secret)
-        )
-        is_mobile_key_valid = is_mobile_header and hmac.compare_digest(x_mobile_key, mobile_secret)
-        if is_mobile_token or is_mobile_key_valid:
-            logger.info("mobile_app_verification_accepted")
-            access_token, expires_at = _issue_web_session()
-            return WebSessionResponse(access_token=access_token, expires_at=expires_at)
-        logger.warning("mobile_verification_failed reason=key_mismatch")
-        raise HTTPException(status_code=403, detail="Invalid mobile app key")
-
+async def web_verify(request: WebVerifyRequest):
+    """Validate a one-use Turnstile token and issue a signed web session."""
     secret_key = os.getenv("TURNSTILE_SECRET_KEY", "")
     if not secret_key or forward_client is None:
         raise HTTPException(status_code=503, detail="Web verification is not configured")
