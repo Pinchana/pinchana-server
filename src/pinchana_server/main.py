@@ -154,7 +154,7 @@ class MobileChallengeResponse(BaseModel):
     guest_allowed: bool
 
 
-class MobileAttestRequest(MobileChallengeRequest):
+class MobileGrantRequest(MobileChallengeRequest):
     challenge_id: str = Field(min_length=16, max_length=128)
     challenge: str = Field(min_length=32, max_length=256)
     provider: Literal["app_attest", "play_integrity", "guest"]
@@ -401,7 +401,13 @@ def _mobile_auth_providers() -> list[Literal["app_attest", "play_integrity", "gu
 
 def _mobile_session_secret() -> bytes:
     secret = os.getenv("MOBILE_SESSION_SECRET", "")
-    if len(secret) < 32:
+    lowered = secret.lower()
+    if (
+        len(secret) < 32
+        or "replace-with" in lowered
+        or "change-me" in lowered
+        or "example" in lowered
+    ):
         raise HTTPException(status_code=503, detail="Mobile authentication is not configured")
     return secret.encode("utf-8")
 
@@ -547,7 +553,7 @@ def _mobile_remote_hash(request: Request) -> str:
     ).hexdigest()
 
 
-async def _verify_mobile_attestation(request: MobileAttestRequest) -> str:
+async def _verify_mobile_attestation(request: MobileGrantRequest) -> str:
     providers = _mobile_auth_providers()
     if request.provider not in providers:
         raise HTTPException(status_code=403, detail="This mobile grant provider is not allowed")
@@ -1245,8 +1251,13 @@ async def mobile_challenge(request: MobileChallengeRequest, http_request: Reques
     )
 
 
-@app.post("/v1/mobile/attest", response_model=MobileSessionGrantResponse)
-async def mobile_attest(request: MobileAttestRequest):
+@app.post("/v1/mobile/grants", response_model=MobileSessionGrantResponse)
+@app.post(
+    "/v1/mobile/attest",
+    response_model=MobileSessionGrantResponse,
+    deprecated=True,
+)
+async def mobile_grant(request: MobileGrantRequest):
     try:
         await asyncio.to_thread(
             _mobile_store().validate_challenge,

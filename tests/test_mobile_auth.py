@@ -159,7 +159,7 @@ def test_guest_installation_grant_refresh_and_session_contract(tmp_path: Path):
                 assert challenge["providers"] == ["guest"]
 
                 grant_response = await client.post(
-                    "/v1/mobile/attest",
+                    "/v1/mobile/grants",
                     json={
                         **identity,
                         "challenge_id": challenge["challenge_id"],
@@ -199,3 +199,24 @@ def test_guest_installation_grant_refresh_and_session_contract(tmp_path: Path):
                 assert revoked_family_response.status_code == 401
 
     asyncio.run(exercise_contract())
+
+
+def test_guest_mode_rejects_example_session_secret(tmp_path: Path):
+    environment = {
+        "MOBILE_AUTH_MODE": "guest",
+        "MOBILE_SESSION_SECRET": "replace-with-a-different-32-character-random-secret",
+        "MOBILE_SESSION_DB_PATH": str(tmp_path / "integration.sqlite3"),
+    }
+
+    async def exercise_policy():
+        with patch.dict(os.environ, environment, clear=False):
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/v1/mobile/auth")
+                assert response.status_code == 503
+                assert (
+                    response.json()["error"]["message"]
+                    == "Mobile authentication is not configured"
+                )
+
+    asyncio.run(exercise_policy())
