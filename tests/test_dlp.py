@@ -56,6 +56,29 @@ def test_job_owner_is_stable_and_nonce_bound():
         }
 
 
+def test_mobile_job_owner_is_stable_across_access_token_refreshes():
+    first_claims = {
+        "typ": "mobile_access",
+        "sub": "installation-one",
+        "jti": "access-token-one",
+    }
+    refreshed_claims = {
+        "typ": "mobile_access",
+        "sub": "installation-one",
+        "jti": "access-token-two",
+    }
+    with patch.dict(os.environ, ENVIRONMENT, clear=False):
+        first = _dlp_job_owner(first_claims)
+        assert first == _dlp_job_owner(refreshed_claims)
+        assert first != _dlp_job_owner(
+            {
+                "typ": "mobile_access",
+                "sub": "installation-two",
+                "jti": "access-token-three",
+            }
+        )
+
+
 def test_job_owner_requires_signed_session_nonce():
     with patch.dict(os.environ, ENVIRONMENT, clear=False), pytest.raises(HTTPException) as failure:
         _dlp_job_owner({})

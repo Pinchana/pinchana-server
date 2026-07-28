@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
@@ -34,6 +34,7 @@ from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManag
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
 from .media_probe import MediaDimensionProbe
+from .mobile_auth import MobileGrantError, MobileGrantStore, MobileInstallation
 from .response_adapter import normalize_scrape_response
 from .schemas import ApiErrorResponse, ScrapeV1Response
 
@@ -118,6 +119,7 @@ internal_client: httpx.AsyncClient | None = None
 gif_conversion_slots = asyncio.Semaphore(2)
 gif_conversion_sessions: set[str] = set()
 gif_conversion_sessions_lock = asyncio.Lock()
+mobile_grant_store: MobileGrantStore | None = None
 
 
 class WebVerifyRequest(BaseModel):
@@ -127,6 +129,50 @@ class WebVerifyRequest(BaseModel):
 class WebSessionResponse(BaseModel):
     access_token: str
     expires_at: int
+
+
+class MobileChallengeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    installation_id: str = Field(
+        min_length=16,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    platform: Literal["ios", "android"]
+    app_id: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]+$",
+    )
+
+
+class MobileChallengeResponse(BaseModel):
+    challenge_id: str
+    challenge: str
+    expires_at: int
+    providers: list[Literal["app_attest", "play_integrity", "guest"]]
+    guest_allowed: bool
+
+
+class MobileAttestRequest(MobileChallengeRequest):
+    challenge_id: str = Field(min_length=16, max_length=128)
+    challenge: str = Field(min_length=32, max_length=256)
+    provider: Literal["app_attest", "play_integrity", "guest"]
+    evidence: str | None = Field(default=None, max_length=64_000)
+
+
+class MobileSessionRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    refresh_token: str = Field(min_length=32, max_length=512)
+
+
+class MobileSessionGrantResponse(BaseModel):
+    access_token: str
+    access_expires_at: int
+    refresh_token: str
+    refresh_expires_at: int
+    installation_id: str
+    trust: Literal["attested", "guest"]
 
 
 class GifConversionRequest(BaseModel):
@@ -318,6 +364,246 @@ def _require_web_session(authorization: str | None = Header(default=None)) -> di
     return _validate_web_session(token)
 
 
+MOBILE_ALL_SCOPES = {
+    "mobile:scrape",
+    "mobile:media",
+    "mobile:capabilities",
+    "mobile:dlp",
+}
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(os.getenv(name, str(default))), maximum))
+    except ValueError:
+        return default
+
+
+def _mobile_auth_mode() -> Literal["disabled", "guest", "attested", "hybrid"]:
+    mode = os.getenv("MOBILE_AUTH_MODE", "disabled").strip().lower()
+    if mode not in {"disabled", "guest", "attested", "hybrid"}:
+        logger.error("Invalid MOBILE_AUTH_MODE=%s", mode)
+        return "disabled"
+    return mode  # type: ignore[return-value]
+
+
+def _mobile_auth_providers() -> list[Literal["app_attest", "play_integrity", "guest"]]:
+    mode = _mobile_auth_mode()
+    providers: list[Literal["app_attest", "play_integrity", "guest"]] = []
+    verifier_url = os.getenv("MOBILE_ATTESTATION_URL", "").strip()
+    verifier_token = os.getenv("MOBILE_ATTESTATION_TOKEN", "")
+    if mode in {"attested", "hybrid"} and verifier_url and len(verifier_token) >= 32:
+        providers.extend(["app_attest", "play_integrity"])
+    if mode in {"guest", "hybrid"}:
+        providers.append("guest")
+    return providers
+
+
+def _mobile_session_secret() -> bytes:
+    secret = os.getenv("MOBILE_SESSION_SECRET", "")
+    if len(secret) < 32:
+        raise HTTPException(status_code=503, detail="Mobile authentication is not configured")
+    return secret.encode("utf-8")
+
+
+def _mobile_store() -> MobileGrantStore:
+    global mobile_grant_store
+    configured_path = Path(
+        os.getenv(
+            "MOBILE_SESSION_DB_PATH",
+            str(Path(os.getenv("CACHE_PATH", "./cache")) / "mobile-sessions.sqlite3"),
+        )
+    )
+    if mobile_grant_store is None or mobile_grant_store.path != configured_path:
+        mobile_grant_store = MobileGrantStore(configured_path)
+        mobile_grant_store.initialize()
+    return mobile_grant_store
+
+
+def _mobile_access_max_age() -> int:
+    return _bounded_int_env("MOBILE_ACCESS_TOKEN_MAX_AGE", 900, 300, 1800)
+
+
+def _mobile_refresh_max_age() -> int:
+    return _bounded_int_env("MOBILE_REFRESH_TOKEN_MAX_AGE", 2_592_000, 86_400, 7_776_000)
+
+
+def _mobile_scopes(trust: str) -> list[str]:
+    if trust == "attested":
+        return sorted(MOBILE_ALL_SCOPES)
+    configured = os.getenv(
+        "MOBILE_GUEST_SCOPES",
+        "mobile:scrape,mobile:media,mobile:capabilities",
+    )
+    return sorted(
+        {
+            scope.strip()
+            for scope in configured.split(",")
+            if scope.strip() in MOBILE_ALL_SCOPES
+        }
+    )
+
+
+def _issue_mobile_access_session(installation: MobileInstallation) -> tuple[str, int]:
+    now = int(time.time())
+    expires_at = now + _mobile_access_max_age()
+    claims = {
+        "v": 1,
+        "iss": "pinchana",
+        "aud": "pinchana-mobile",
+        "typ": "mobile_access",
+        "sub": installation.installation_id,
+        "platform": installation.platform,
+        "app_id": installation.app_id,
+        "trust": installation.trust,
+        "scope": _mobile_scopes(installation.trust),
+        "jti": secrets.token_urlsafe(12),
+        "iat": now,
+        "exp": expires_at,
+    }
+    payload = _urlsafe_encode(
+        json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signature = _urlsafe_encode(
+        hmac.new(_mobile_session_secret(), payload.encode("ascii"), hashlib.sha256).digest()
+    )
+    return f"{payload}.{signature}", expires_at
+
+
+def _validate_mobile_session(token: str) -> dict[str, Any]:
+    try:
+        payload, signature = token.split(".", 1)
+        expected = _urlsafe_encode(
+            hmac.new(_mobile_session_secret(), payload.encode("ascii"), hashlib.sha256).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("signature mismatch")
+        claims = json.loads(_urlsafe_decode(payload))
+        now = int(time.time())
+        if (
+            not isinstance(claims, dict)
+            or claims.get("iss") != "pinchana"
+            or claims.get("aud") != "pinchana-mobile"
+            or claims.get("typ") != "mobile_access"
+            or not isinstance(claims.get("sub"), str)
+            or not isinstance(claims.get("jti"), str)
+            or not isinstance(claims.get("scope"), list)
+            or not all(isinstance(scope, str) for scope in claims["scope"])
+            or int(claims["iat"]) > now + 60
+            or int(claims["exp"]) <= now
+        ):
+            raise ValueError("invalid mobile claims")
+        return claims
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired mobile session") from exc
+
+
+def _require_mobile_session(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=401, detail="Invalid or missing mobile session")
+    return _validate_mobile_session(token)
+
+
+def _require_mobile_scope(claims: dict[str, Any], required_scope: str) -> dict[str, Any]:
+    if required_scope not in claims.get("scope", []):
+        raise HTTPException(status_code=403, detail="Mobile session does not grant this operation")
+    return claims
+
+
+def _require_mobile_scrape_session(
+    claims: dict[str, Any] = Depends(_require_mobile_session),
+) -> dict[str, Any]:
+    return _require_mobile_scope(claims, "mobile:scrape")
+
+
+def _require_mobile_media_session(
+    claims: dict[str, Any] = Depends(_require_mobile_session),
+) -> dict[str, Any]:
+    return _require_mobile_scope(claims, "mobile:media")
+
+
+def _require_mobile_capabilities_session(
+    claims: dict[str, Any] = Depends(_require_mobile_session),
+) -> dict[str, Any]:
+    return _require_mobile_scope(claims, "mobile:capabilities")
+
+
+def _require_mobile_dlp_session(
+    claims: dict[str, Any] = Depends(_require_mobile_session),
+) -> dict[str, Any]:
+    return _require_mobile_scope(claims, "mobile:dlp")
+
+
+def _mobile_remote_hash(request: Request) -> str:
+    remote = request.client.host if request.client else "unknown"
+    if os.getenv("MOBILE_TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}:
+        forwarded = request.headers.get("x-forwarded-for", "").partition(",")[0].strip()
+        remote = request.headers.get("cf-connecting-ip", "").strip() or forwarded or remote
+    return hmac.new(
+        _mobile_session_secret(),
+        remote.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+async def _verify_mobile_attestation(request: MobileAttestRequest) -> str:
+    providers = _mobile_auth_providers()
+    if request.provider not in providers:
+        raise HTTPException(status_code=403, detail="This mobile grant provider is not allowed")
+    if request.provider == "guest":
+        if request.evidence is not None:
+            raise HTTPException(status_code=400, detail="Guest grants do not accept attestation evidence")
+        return "guest"
+    if request.provider == "app_attest" and request.platform != "ios":
+        raise HTTPException(status_code=400, detail="App Attest is only valid for iOS")
+    if request.provider == "play_integrity" and request.platform != "android":
+        raise HTTPException(status_code=400, detail="Play Integrity is only valid for Android")
+    if not request.evidence:
+        raise HTTPException(status_code=400, detail="Attestation evidence is required")
+
+    verifier_url = os.getenv("MOBILE_ATTESTATION_URL", "").strip()
+    verifier_token = os.getenv("MOBILE_ATTESTATION_TOKEN", "")
+    if not verifier_url or len(verifier_token) < 32 or forward_client is None:
+        raise HTTPException(status_code=503, detail="Mobile attestation verifier is not configured")
+    try:
+        response = await forward_client.post(
+            verifier_url,
+            headers={"Authorization": f"Bearer {verifier_token}"},
+            json=request.model_dump(mode="json"),
+            timeout=httpx.Timeout(15, connect=5),
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("mobile_attestation_unavailable provider=%s", request.provider)
+        raise HTTPException(status_code=503, detail="Mobile attestation is temporarily unavailable") from exc
+    if (
+        not isinstance(result, dict)
+        or result.get("valid") is not True
+        or result.get("platform") != request.platform
+        or result.get("app_id") != request.app_id
+    ):
+        raise HTTPException(status_code=403, detail="Mobile attestation failed")
+    return "attested"
+
+
+def _mobile_grant_response(
+    installation: MobileInstallation,
+    refresh_token: str,
+    refresh_expires_at: int,
+) -> MobileSessionGrantResponse:
+    access_token, access_expires_at = _issue_mobile_access_session(installation)
+    return MobileSessionGrantResponse(
+        access_token=access_token,
+        access_expires_at=access_expires_at,
+        refresh_token=refresh_token,
+        refresh_expires_at=refresh_expires_at,
+        installation_id=installation.installation_id,
+        trust=installation.trust,  # type: ignore[arg-type]
+    )
+
+
 def _dlp_enabled() -> bool:
     return os.getenv("DLP_ENABLED", "false").lower() in {"1", "true", "yes"}
 
@@ -343,11 +629,11 @@ def _dlp_config() -> tuple[str, str]:
 
 
 def _dlp_job_owner(claims: dict[str, Any]) -> str:
-    nonce = claims.get("nonce")
-    if not isinstance(nonce, str) or not nonce:
-        raise HTTPException(status_code=401, detail="Invalid web session")
+    owner_id = claims.get("sub") if claims.get("typ") == "mobile_access" else claims.get("nonce")
+    if not isinstance(owner_id, str) or not owner_id:
+        raise HTTPException(status_code=401, detail="Invalid session owner")
     owner_secret = os.getenv("DLP_OWNER_SECRET", "").encode("utf-8") or _session_secret()
-    return _urlsafe_encode(hmac.new(owner_secret, nonce.encode("utf-8"), hashlib.sha256).digest())
+    return _urlsafe_encode(hmac.new(owner_secret, owner_id.encode("utf-8"), hashlib.sha256).digest())
 
 
 async def _dlp_capabilities() -> dict[str, Any] | None:
@@ -449,6 +735,9 @@ async def lifespan(app: FastAPI):
         base_url="http://pinchana.internal",
         timeout=120.0,
     )
+    if _mobile_auth_mode() != "disabled":
+        _mobile_session_secret()
+        await asyncio.to_thread(_mobile_store)
     try:
         yield
     finally:
@@ -901,69 +1190,156 @@ async def process_v1_web_scrape_request(
 async def process_v1_mobile_scrape_request(
     request: ScrapeRequest,
     http_request: Request,
-    _claims: dict[str, Any] = Depends(_require_web_session),
+    _claims: dict[str, Any] = Depends(_require_mobile_scrape_session),
 ):
     """Return a normalized scrape response protected by a mobile session."""
     logger.info("authenticated_v1_mobile_scrape")
     result = await _normalized_scrape_response(request, http_request)
-    rewritten = _rewrite_media_urls(result.model_dump(), "/web/media")
+    rewritten = _rewrite_media_urls(result.model_dump(), "/mobile/media")
     return ScrapeV1Response.model_validate(rewritten)
 
 
-def _mobile_api_key() -> str | None:
+@app.get("/v1/mobile/auth")
+async def mobile_auth_policy():
+    providers = _mobile_auth_providers()
+    if not providers:
+        raise HTTPException(status_code=503, detail="Mobile authentication is disabled")
+    _mobile_session_secret()
+    return {
+        "providers": providers,
+        "guest_allowed": "guest" in providers,
+        "access_token_max_age": _mobile_access_max_age(),
+    }
+
+
+@app.post("/v1/mobile/challenges", response_model=MobileChallengeResponse)
+async def mobile_challenge(request: MobileChallengeRequest, http_request: Request):
+    providers = _mobile_auth_providers()
+    if not providers:
+        raise HTTPException(status_code=503, detail="Mobile authentication is disabled")
+    challenge_ttl = _bounded_int_env("MOBILE_CHALLENGE_TTL", 120, 60, 300)
     try:
-        keys = _configured_api_keys()
-        if isinstance(keys, dict) and "mobile" in keys:
-            val = str(keys["mobile"]).strip()
-            return val if val else None
-    except Exception:
-        pass
-    return None
-
-
-@app.post("/v1/mobile/verify", response_model=WebSessionResponse)
-async def mobile_verify(
-    request: WebVerifyRequest,
-    x_api_key: str | None = Header(default=None),
-    x_mobile_key: str | None = Header(default=None),
-):
-    """Validate explicit mobile API key from PINCHANA_API_KEYS['mobile'] and issue a signed session."""
-    expected_key = _mobile_api_key()
-    if not expected_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Mobile API key is not configured in PINCHANA_API_KEYS",
+        challenge = await asyncio.to_thread(
+            _mobile_store().create_challenge,
+            installation_id=request.installation_id,
+            platform=request.platform,
+            app_id=request.app_id,
+            remote_hash=_mobile_remote_hash(http_request),
+            ttl_seconds=challenge_ttl,
+            rate_window_seconds=_bounded_int_env(
+                "MOBILE_CHALLENGE_RATE_WINDOW",
+                600,
+                60,
+                3600,
+            ),
+            rate_limit=_bounded_int_env("MOBILE_CHALLENGE_RATE_LIMIT", 10, 1, 100),
         )
+    except MobileGrantError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return MobileChallengeResponse(
+        challenge_id=challenge.challenge_id,
+        challenge=challenge.challenge,
+        expires_at=challenge.expires_at,
+        providers=providers,
+        guest_allowed="guest" in providers,
+    )
 
-    candidate_key: str | None = None
-    if isinstance(x_api_key, str) and x_api_key:
-        candidate_key = x_api_key
-    elif isinstance(x_mobile_key, str) and x_mobile_key:
-        candidate_key = x_mobile_key
-    elif request.token.startswith("mobile:"):
-        candidate_key = request.token.partition("mobile:")[2]
-    elif request.token.startswith("key:"):
-        candidate_key = request.token.partition("key:")[2]
-    else:
-        candidate_key = request.token
 
-    if not candidate_key or not hmac.compare_digest(candidate_key, expected_key):
-        raise HTTPException(status_code=401, detail="Invalid mobile API key")
+@app.post("/v1/mobile/attest", response_model=MobileSessionGrantResponse)
+async def mobile_attest(request: MobileAttestRequest):
+    try:
+        await asyncio.to_thread(
+            _mobile_store().validate_challenge,
+            challenge_id=request.challenge_id,
+            challenge=request.challenge,
+            installation_id=request.installation_id,
+            platform=request.platform,
+            app_id=request.app_id,
+        )
+    except MobileGrantError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    trust = await _verify_mobile_attestation(request)
+    try:
+        installation = await asyncio.to_thread(
+            _mobile_store().consume_challenge,
+            challenge_id=request.challenge_id,
+            challenge=request.challenge,
+            installation_id=request.installation_id,
+            platform=request.platform,
+            app_id=request.app_id,
+            trust=trust,
+        )
+        refresh = await asyncio.to_thread(
+            _mobile_store().issue_refresh,
+            installation,
+            ttl_seconds=_mobile_refresh_max_age(),
+        )
+    except MobileGrantError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    logger.info(
+        "mobile_installation_granted platform=%s trust=%s",
+        installation.platform,
+        installation.trust,
+    )
+    return _mobile_grant_response(
+        installation,
+        refresh.refresh_token,
+        refresh.refresh_expires_at,
+    )
 
-    logger.info("mobile_verification_accepted")
-    access_token, expires_at = _issue_web_session()
-    return WebSessionResponse(access_token=access_token, expires_at=expires_at)
+
+@app.post("/v1/mobile/session/refresh", response_model=MobileSessionGrantResponse)
+async def mobile_session_refresh(request: MobileSessionRefreshRequest):
+    try:
+        refresh = await asyncio.to_thread(
+            _mobile_store().rotate_refresh,
+            request.refresh_token,
+            ttl_seconds=_mobile_refresh_max_age(),
+        )
+    except MobileGrantError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return _mobile_grant_response(
+        refresh.installation,
+        refresh.refresh_token,
+        refresh.refresh_expires_at,
+    )
+
+
+@app.delete("/v1/mobile/session", status_code=204)
+async def mobile_session_revoke(request: MobileSessionRefreshRequest):
+    await asyncio.to_thread(
+        _mobile_store().revoke_refresh_family,
+        request.refresh_token,
+    )
+    return Response(status_code=204)
+
+
+@app.post("/v1/mobile/verify", status_code=410)
+async def mobile_verify():
+    """Retired static-key exchange kept only as an explicit migration signal."""
+    raise HTTPException(
+        status_code=410,
+        detail="Bundled mobile API keys are no longer accepted; use installation grants",
+    )
 
 
 @app.get("/v1/mobile/session")
-async def mobile_session(claims: dict[str, Any] = Depends(_require_web_session)):
-    return {"valid": True, "expires_at": claims["exp"]}
+async def mobile_session(claims: dict[str, Any] = Depends(_require_mobile_session)):
+    return {
+        "valid": True,
+        "expires_at": claims["exp"],
+        "installation_id": claims["sub"],
+        "trust": claims["trust"],
+        "scope": claims["scope"],
+    }
 
 
 @app.get("/v1/mobile/capabilities")
-async def mobile_capabilities(_claims: dict[str, Any] = Depends(_require_web_session)):
+async def mobile_capabilities(
+    claims: dict[str, Any] = Depends(_require_mobile_capabilities_session),
+):
     capabilities = await _dlp_capabilities() if _dlp_enabled() else None
-    available = capabilities is not None
+    available = capabilities is not None and "mobile:dlp" in claims["scope"]
     return JSONResponse(
         content={
             "available": available,
@@ -1184,6 +1560,44 @@ async def web_dlp_file(
     )
 
 
+@app.post("/v1/mobile/dlp/jobs")
+async def mobile_dlp_allocate(
+    claims: dict[str, Any] = Depends(_require_mobile_dlp_session),
+):
+    return await _dlp_json("POST", "/v2/jobs", claims)
+
+
+@app.post("/v1/mobile/dlp/jobs/{job_id}/submit")
+async def mobile_dlp_submit(
+    job_id: uuid.UUID,
+    request: DlpSubmitRequest,
+    claims: dict[str, Any] = Depends(_require_mobile_dlp_session),
+):
+    return await _dlp_json(
+        "POST",
+        f"/v2/jobs/{job_id}/submit",
+        claims,
+        request.model_dump(mode="json", exclude_none=True),
+    )
+
+
+@app.get("/v1/mobile/dlp/jobs/{job_id}")
+async def mobile_dlp_status(
+    job_id: uuid.UUID,
+    claims: dict[str, Any] = Depends(_require_mobile_dlp_session),
+):
+    return await _dlp_json("GET", f"/v2/jobs/{job_id}", claims)
+
+
+@app.get("/v1/mobile/dlp/jobs/{job_id}/file")
+async def mobile_dlp_file(
+    job_id: uuid.UUID,
+    request: Request,
+    claims: dict[str, Any] = Depends(_require_mobile_dlp_session),
+):
+    return await web_dlp_file(job_id, request, claims)
+
+
 @app.post("/web/scrape", response_model=ScrapeResponse)
 async def web_scrape_request(
     request: ScrapeRequest,
@@ -1210,6 +1624,16 @@ async def serve_web_media(
     post_id: str,
     filename: str,
     _claims: dict[str, Any] = Depends(_require_web_session),
+):
+    return _serve_media_file(post_id, filename)
+
+
+@app.get("/mobile/media/{platform}/{post_id}/{filename:path}")
+async def serve_mobile_media(
+    platform: str,
+    post_id: str,
+    filename: str,
+    _claims: dict[str, Any] = Depends(_require_mobile_media_session),
 ):
     return _serve_media_file(post_id, filename)
 
@@ -1270,6 +1694,23 @@ async def admin_vpn_status(_client_name: str = Depends(_require_api_key)):
         return {"vpn": status, "public_ip": public_ip}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to query VPN status: {e}")
+
+
+@app.delete("/admin/mobile/installations/{installation_id}", status_code=204)
+async def admin_revoke_mobile_installation(
+    installation_id: str,
+    _client_name: str = Depends(_require_api_key),
+):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", installation_id):
+        raise HTTPException(status_code=400, detail="Invalid mobile installation ID")
+    revoked = await asyncio.to_thread(
+        _mobile_store().revoke_installation,
+        installation_id,
+    )
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Mobile installation not found")
+    logger.info("mobile_installation_revoked")
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

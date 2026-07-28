@@ -11,15 +11,18 @@ from pinchana_server.main import (
     TURNSTILE_SITEVERIFY_URL,
     WebVerifyRequest,
     _configured_api_keys,
+    _issue_mobile_access_session,
     _issue_web_session,
     _rewrite_media_urls,
     _turnstile_rejection_reason,
     _valid_turnstile_result,
+    _validate_mobile_session,
     _validate_web_session,
     mobile_verify,
     web_identity,
     web_verify,
 )
+from pinchana_server.mobile_auth import MobileInstallation
 
 
 class GatewayAuthTests(unittest.TestCase):
@@ -167,43 +170,45 @@ class GatewayAuthTests(unittest.TestCase):
         self.assertEqual(call.kwargs["data"]["secret"], "private-secret")
         self.assertEqual(call.kwargs["data"]["response"], "browser-token")
 
-    def test_mobile_verify_valid_token(self):
+    def test_mobile_access_session_is_typed_scoped_and_tamper_resistant(self):
         environment = {
-            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
-            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+            "MOBILE_SESSION_SECRET": "mobile-secret-0123456789abcdef0123456789",
+            "MOBILE_ACCESS_TOKEN_MAX_AGE": "600",
         }
         with patch.dict(os.environ, environment):
-            session = asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:my-mobile-secret-key")))
-        self.assertTrue(session.access_token)
-
-    def test_mobile_verify_valid_header(self):
-        environment = {
-            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
-            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
-        }
-        with patch.dict(os.environ, environment):
-            session = asyncio.run(mobile_verify(WebVerifyRequest(token="default"), x_mobile_key="my-mobile-secret-key"))
-        self.assertTrue(session.access_token)
-
-    def test_mobile_verify_invalid_key_raises_401(self):
-        environment = {
-            "PINCHANA_API_KEYS": json.dumps({"mobile": "my-mobile-secret-key"}),
-            "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
-        }
-        with patch.dict(os.environ, environment):
+            token, expires_at = _issue_mobile_access_session(
+                MobileInstallation(
+                    installation_id="install_0123456789",
+                    platform="ios",
+                    app_id="cc.pinchana.mobile",
+                    trust="attested",
+                )
+            )
+            claims = _validate_mobile_session(token)
+            self.assertEqual(claims["aud"], "pinchana-mobile")
+            self.assertEqual(claims["typ"], "mobile_access")
+            self.assertEqual(claims["sub"], "install_0123456789")
+            self.assertIn("mobile:scrape", claims["scope"])
+            self.assertEqual(claims["exp"], expires_at)
             with self.assertRaises(HTTPException) as raised:
-                asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:wrong-key")))
+                _validate_mobile_session(f"{token}tampered")
         self.assertEqual(raised.exception.status_code, 401)
 
-    def test_mobile_verify_missing_server_secret_raises_503(self):
+    def test_web_session_cannot_be_used_as_mobile_session(self):
         environment = {
-            "PINCHANA_API_KEYS": json.dumps({}),
             "TURNSTILE_SESSION_SECRET": "0123456789abcdef0123456789abcdef",
+            "MOBILE_SESSION_SECRET": "mobile-secret-0123456789abcdef0123456789",
         }
         with patch.dict(os.environ, environment):
+            token, _expires_at = _issue_web_session()
             with self.assertRaises(HTTPException) as raised:
-                asyncio.run(mobile_verify(WebVerifyRequest(token="mobile:some-key")))
-        self.assertEqual(raised.exception.status_code, 503)
+                _validate_mobile_session(token)
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_static_mobile_key_exchange_is_retired(self):
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(mobile_verify())
+        self.assertEqual(raised.exception.status_code, 410)
 
 
 if __name__ == "__main__":
