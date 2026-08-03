@@ -370,6 +370,11 @@ MOBILE_ALL_SCOPES = {
     "mobile:capabilities",
     "mobile:dlp",
 }
+MOBILE_ANONYMOUS_SCOPES = {
+    "mobile:scrape",
+    "mobile:media",
+    "mobile:capabilities",
+}
 
 
 def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -385,6 +390,14 @@ def _mobile_auth_mode() -> Literal["disabled", "guest", "attested", "hybrid"]:
         logger.error("Invalid MOBILE_AUTH_MODE=%s", mode)
         return "disabled"
     return mode  # type: ignore[return-value]
+
+
+def _mobile_auth_required() -> bool:
+    return os.getenv("MOBILE_AUTH_REQUIRED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _mobile_auth_providers() -> list[Literal["app_attest", "play_integrity", "guest"]]:
@@ -511,26 +524,40 @@ def _require_mobile_session(authorization: str | None = Header(default=None)) ->
     return _validate_mobile_session(token)
 
 
+def _optional_mobile_session(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if authorization:
+        return _require_mobile_session(authorization)
+    if _mobile_auth_required():
+        raise HTTPException(status_code=401, detail="Invalid or missing mobile session")
+    return {
+        "typ": "mobile_anonymous",
+        "trust": "anonymous",
+        "scope": sorted(MOBILE_ANONYMOUS_SCOPES),
+    }
+
+
 def _require_mobile_scope(claims: dict[str, Any], required_scope: str) -> dict[str, Any]:
     if required_scope not in claims.get("scope", []):
         raise HTTPException(status_code=403, detail="Mobile session does not grant this operation")
     return claims
 
 
-def _require_mobile_scrape_session(
-    claims: dict[str, Any] = Depends(_require_mobile_session),
+def _mobile_scrape_session(
+    claims: dict[str, Any] = Depends(_optional_mobile_session),
 ) -> dict[str, Any]:
     return _require_mobile_scope(claims, "mobile:scrape")
 
 
-def _require_mobile_media_session(
-    claims: dict[str, Any] = Depends(_require_mobile_session),
+def _mobile_media_session(
+    claims: dict[str, Any] = Depends(_optional_mobile_session),
 ) -> dict[str, Any]:
     return _require_mobile_scope(claims, "mobile:media")
 
 
-def _require_mobile_capabilities_session(
-    claims: dict[str, Any] = Depends(_require_mobile_session),
+def _mobile_capabilities_session(
+    claims: dict[str, Any] = Depends(_optional_mobile_session),
 ) -> dict[str, Any]:
     return _require_mobile_scope(claims, "mobile:capabilities")
 
@@ -729,6 +756,21 @@ def _valid_turnstile_result(result: Any, *, enforce_metadata: bool = True) -> bo
     return _turnstile_rejection_reason(result, enforce_metadata=enforce_metadata) is None
 
 
+async def _initialize_mobile_auth() -> None:
+    if _mobile_auth_mode() == "disabled":
+        return
+    try:
+        _mobile_session_secret()
+    except HTTPException:
+        if _mobile_auth_required():
+            raise
+        logger.warning(
+            "Mobile authentication is not configured; continuing with anonymous mobile access"
+        )
+        return
+    await asyncio.to_thread(_mobile_store)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global forward_client, internal_client
@@ -741,9 +783,7 @@ async def lifespan(app: FastAPI):
         base_url="http://pinchana.internal",
         timeout=120.0,
     )
-    if _mobile_auth_mode() != "disabled":
-        _mobile_session_secret()
-        await asyncio.to_thread(_mobile_store)
+    await _initialize_mobile_auth()
     try:
         yield
     finally:
@@ -809,6 +849,8 @@ def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
         return "invalid_url", raw_message
     if status_code == 401 and "web session" in lowered:
         return "unauthorized", "Invalid or missing web session"
+    if status_code == 401 and "mobile session" in lowered:
+        return "unauthorized", raw_message
     mapping = {
         401: ("unauthorized", "Invalid or missing API key"),
         403: ("forbidden", raw_message),
@@ -1196,10 +1238,13 @@ async def process_v1_web_scrape_request(
 async def process_v1_mobile_scrape_request(
     request: ScrapeRequest,
     http_request: Request,
-    _claims: dict[str, Any] = Depends(_require_mobile_scrape_session),
+    claims: dict[str, Any] = Depends(_mobile_scrape_session),
 ):
-    """Return a normalized scrape response protected by a mobile session."""
-    logger.info("authenticated_v1_mobile_scrape")
+    """Return a normalized scrape response with optional mobile authentication."""
+    logger.info(
+        "v1_mobile_scrape authenticated=%s",
+        claims.get("typ") == "mobile_access",
+    )
     result = await _normalized_scrape_response(request, http_request)
     rewritten = _rewrite_media_urls(result.model_dump(), "/mobile/media")
     return ScrapeV1Response.model_validate(rewritten)
@@ -1209,9 +1254,17 @@ async def process_v1_mobile_scrape_request(
 async def mobile_auth_policy():
     providers = _mobile_auth_providers()
     if not providers:
-        raise HTTPException(status_code=503, detail="Mobile authentication is disabled")
+        if _mobile_auth_required():
+            raise HTTPException(status_code=503, detail="Mobile authentication is disabled")
+        return {
+            "required": False,
+            "providers": [],
+            "guest_allowed": False,
+            "access_token_max_age": _mobile_access_max_age(),
+        }
     _mobile_session_secret()
     return {
+        "required": _mobile_auth_required(),
         "providers": providers,
         "guest_allowed": "guest" in providers,
         "access_token_max_age": _mobile_access_max_age(),
@@ -1347,7 +1400,7 @@ async def mobile_session(claims: dict[str, Any] = Depends(_require_mobile_sessio
 
 @app.get("/v1/mobile/capabilities")
 async def mobile_capabilities(
-    claims: dict[str, Any] = Depends(_require_mobile_capabilities_session),
+    claims: dict[str, Any] = Depends(_mobile_capabilities_session),
 ):
     capabilities = await _dlp_capabilities() if _dlp_enabled() else None
     available = capabilities is not None and "mobile:dlp" in claims["scope"]
@@ -1644,7 +1697,7 @@ async def serve_mobile_media(
     platform: str,
     post_id: str,
     filename: str,
-    _claims: dict[str, Any] = Depends(_require_mobile_media_session),
+    _claims: dict[str, Any] = Depends(_mobile_media_session),
 ):
     return _serve_media_file(post_id, filename)
 

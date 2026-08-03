@@ -288,6 +288,11 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
         finally:
             app.dependency_overrides.pop(_require_web_session, None)
 
+    async def _mobile_request(self, *, payload, headers=None):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.post("/v1/mobile/scrape", json=payload, headers=headers)
+
     async def test_v1_success_and_legacy_contract_coexist(self):
         raw = _legacy_payload()
         environment = {"PINCHANA_API_KEYS": '{"test":"secret"}'}
@@ -338,6 +343,37 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
         self.assertEqual(response.json()["error"]["message"], "Invalid or missing web session")
+
+    async def test_v1_mobile_authentication_is_optional_but_invalid_tokens_are_rejected(self):
+        raw = _legacy_payload()
+        with patch.dict(os.environ, {"MOBILE_AUTH_REQUIRED": "false"}, clear=False), patch(
+            "pinchana_server.main._process_scrape_payload",
+            AsyncMock(return_value=("instagram", raw)),
+        ):
+            anonymous = await self._mobile_request(
+                payload={"url": "https://www.instagram.com/p/POST123/"},
+            )
+            invalid = await self._mobile_request(
+                payload={"url": "https://www.instagram.com/p/POST123/"},
+                headers={"Authorization": "Bearer invalid"},
+            )
+
+        self.assertEqual(anonymous.status_code, 200)
+        self.assertEqual(
+            anonymous.json()["data"]["media"][0]["url"],
+            "/mobile/media/instagram/POST123/image.jpg",
+        )
+        self.assertEqual(invalid.status_code, 401)
+        self.assertEqual(invalid.json()["error"]["code"], "unauthorized")
+
+    async def test_v1_mobile_authentication_can_be_required_by_configuration(self):
+        with patch.dict(os.environ, {"MOBILE_AUTH_REQUIRED": "true"}, clear=False):
+            response = await self._mobile_request(
+                payload={"url": "https://www.instagram.com/p/POST123/"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["message"], "Invalid or missing mobile session")
 
     async def test_v1_auth_and_validation_use_error_envelopes(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []})

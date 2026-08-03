@@ -5,8 +5,9 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
-from pinchana_server.main import app
+from pinchana_server.main import _initialize_mobile_auth, app
 from pinchana_server.mobile_auth import MobileGrantError, MobileGrantStore
 
 
@@ -220,3 +221,81 @@ def test_guest_mode_rejects_example_session_secret(tmp_path: Path):
                 )
 
     asyncio.run(exercise_policy())
+
+
+def test_disabled_mobile_auth_is_optional_by_default():
+    environment = {
+        "MOBILE_AUTH_MODE": "disabled",
+        "MOBILE_AUTH_REQUIRED": "false",
+        "DLP_ENABLED": "false",
+    }
+
+    async def exercise_policy():
+        with patch.dict(os.environ, environment, clear=False):
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                policy = await client.get("/v1/mobile/auth")
+                capabilities = await client.get("/v1/mobile/capabilities")
+                media = await client.get(
+                    "/mobile/media/test/definitely-missing/mobile-auth-test.jpg"
+                )
+                private_job = await client.post("/v1/mobile/dlp/jobs")
+
+                assert policy.status_code == 200
+                assert policy.json() == {
+                    "required": False,
+                    "providers": [],
+                    "guest_allowed": False,
+                    "access_token_max_age": 900,
+                }
+                assert capabilities.status_code == 200
+                assert capabilities.json() == {"available": False, "dlp": None}
+                assert media.status_code == 404
+                assert private_job.status_code == 401
+
+    asyncio.run(exercise_policy())
+
+
+def test_disabled_mobile_auth_can_still_fail_closed():
+    environment = {
+        "MOBILE_AUTH_MODE": "disabled",
+        "MOBILE_AUTH_REQUIRED": "true",
+    }
+
+    async def exercise_policy():
+        with patch.dict(os.environ, environment, clear=False):
+            transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                policy = await client.get("/v1/mobile/auth")
+                capabilities = await client.get("/v1/mobile/capabilities")
+
+                assert policy.status_code == 503
+                assert capabilities.status_code == 401
+
+    asyncio.run(exercise_policy())
+
+
+def test_optional_mobile_auth_does_not_block_startup_without_a_secret():
+    environment = {
+        "MOBILE_AUTH_MODE": "guest",
+        "MOBILE_AUTH_REQUIRED": "false",
+        "MOBILE_SESSION_SECRET": "",
+    }
+    with patch.dict(os.environ, environment, clear=False), patch(
+        "pinchana_server.main._mobile_store"
+    ) as grant_store:
+        asyncio.run(_initialize_mobile_auth())
+    grant_store.assert_not_called()
+
+
+def test_required_mobile_auth_still_blocks_startup_without_a_secret():
+    environment = {
+        "MOBILE_AUTH_MODE": "guest",
+        "MOBILE_AUTH_REQUIRED": "true",
+        "MOBILE_SESSION_SECRET": "",
+    }
+    with patch.dict(os.environ, environment, clear=False), pytest.raises(
+        HTTPException,
+        match="Mobile authentication is not configured",
+    ):
+        asyncio.run(_initialize_mobile_auth())
