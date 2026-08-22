@@ -124,6 +124,7 @@ Returns a list of all configured modules and their status.
 | `CACHE_PATH` | `./cache` | Base path for serving cached media. |
 | `PINCHANA_INSTANCE_CERTIFICATE` | unset | Project-issued JSON certificate envelope for this public origin. |
 | `PINCHANA_INSTANCE_CERTIFICATE_FILE` | unset | Mounted certificate file used instead of the inline value. |
+| `PINCHANA_BUILD_VERSION` | `development` | Validated product CalVer baked into official images and exposed by build metadata. |
 | `PINCHANA_BUILD_COMMIT` | unset | Parent API commit baked into official images; used as a manifest fallback. |
 | `PINCHANA_BUILD_COMMITS` | unset | JSON map of public API and module commits, normally baked by release CI. |
 

@@ -1,6 +1,6 @@
 [project]
 name = "pinchana-server"
-version = "0.2b0"
+version = "26.8.1"
 description = "Unified scraper server with runtime plugin discovery"
 readme = "README.md"
 requires-python = ">=3.13"

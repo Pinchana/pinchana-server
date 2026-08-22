@@ -133,15 +133,27 @@ def test_public_build_manifest_filters_untrusted_values():
         "bad name": {"commit": "c" * 40},
         "secret": {"commit": "not-a-commit", "repository": "https://internal.example/repo"},
     })
-    with patch.dict(os.environ, {"PINCHANA_BUILD_COMMITS": manifest}, clear=False):
+    with patch.dict(
+        os.environ,
+        {
+            "PINCHANA_BUILD_VERSION": "26.08.1+dev.abcdef012345",
+            "PINCHANA_BUILD_COMMITS": manifest,
+        },
+        clear=False,
+    ):
         result = _public_build_manifest()
     assert result == {
-        "version": "preview",
+        "version": "26.08.1+dev.abcdef012345",
         "commits": {
             "api": {"commit": "a" * 40, "repository": "https://github.com/Pinchana/pinchana-api"},
             "threads": {"commit": "b" * 40, "repository": "https://github.com/Pinchana/pinchana-threads"},
         },
     }
+
+
+def test_public_build_manifest_rejects_an_invalid_version():
+    with patch.dict(os.environ, {"PINCHANA_BUILD_VERSION": "latest<script>"}, clear=False):
+        assert _public_build_manifest()["version"] == "development"
 
 
 def test_public_build_endpoint_needs_no_session():

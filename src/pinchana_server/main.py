@@ -60,6 +60,11 @@ FILENAME_STYLES = {"classic", "basic", "pretty", "nerdy"}
 BUILD_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 BUILD_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 BUILD_REPOSITORY_PATTERN = re.compile(r"^https://github\.com/Pinchana/[A-Za-z0-9_.-]+$")
+BUILD_VERSION_PATTERN = re.compile(
+    r"^\d{2}\.(?:0[1-9]|1[0-2])\.(?:[1-9]\d*)"
+    r"(?:\+dev\.[0-9a-f]{7,40})?$",
+    re.IGNORECASE,
+)
 GIF_MAX_INPUT_BYTES = 50 * 1024 * 1024
 GIF_MAX_OUTPUT_BYTES = 50 * 1024 * 1024
 GIF_MAX_DURATION_SECONDS = 60.0
@@ -237,6 +242,11 @@ class DlpSubmitRequest(BaseModel):
         return value
 
 
+def _public_build_version() -> str:
+    version = os.getenv("PINCHANA_BUILD_VERSION", "").strip()
+    return version if BUILD_VERSION_PATTERN.fullmatch(version) else "development"
+
+
 def _public_build_manifest() -> dict[str, Any]:
     """Return only validated public source revisions from the baked manifest."""
     raw_manifest = os.getenv("PINCHANA_BUILD_COMMITS", "").strip()
@@ -273,7 +283,7 @@ def _public_build_manifest() -> dict[str, Any]:
             entry["repository"] = repository
         commits[name] = entry
 
-    return {"version": "preview", "commits": commits}
+    return {"version": _public_build_version(), "commits": commits}
 
 
 def _configured_api_keys() -> dict[str, str]:
@@ -792,7 +802,7 @@ async def lifespan(app: FastAPI):
         await storage.close()
 
 
-app = FastAPI(title="Pinchana Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Pinchana Server", version=_public_build_version(), lifespan=lifespan)
 
 
 def _is_v1_request(request: Request) -> bool:
