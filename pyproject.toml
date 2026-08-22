@@ -9,7 +9,7 @@ dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
-    "uvicorn>=0.52.1",
+    "uvicorn>=0.52.4",
 ]
 
 [dependency-groups]
@@ -21,5 +21,5 @@ dev = [
 pinchana-core = { path = "../pinchana-core" }
 
 [build-system]
-requires = ["uv_build>=0.12.2,<0.13.0"]
+requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
