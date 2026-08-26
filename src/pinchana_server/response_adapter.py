@@ -46,14 +46,24 @@ def _non_negative_int(value: Any) -> int | None:
 def _author(raw: dict[str, Any], platform: Platform) -> ScrapeAuthor:
     author = _text(raw.get("author"))
     explicit_username = _text(raw.get("username"))
+    avatar_url = _text(raw.get("avatar_url"))
     if platform == "twitter":
         return ScrapeAuthor(
             name=_text(raw.get("author_name")) or author,
             username=explicit_username or author,
+            avatar_url=avatar_url,
         )
     if platform in {"instagram", "threads"}:
-        return ScrapeAuthor(name=author, username=explicit_username or author)
-    return ScrapeAuthor(name=author, username=explicit_username)
+        return ScrapeAuthor(
+            name=author,
+            username=explicit_username or author,
+            avatar_url=avatar_url,
+        )
+    return ScrapeAuthor(
+        name=author,
+        username=explicit_username,
+        avatar_url=avatar_url,
+    )
 
 
 def _engagement(raw: dict[str, Any]) -> EngagementMetadata | None:

@@ -52,6 +52,7 @@ class ScrapeContent(BaseModel):
 class ScrapeAuthor(BaseModel):
     name: str | None = None
     username: str | None = None
+    avatar_url: str | None = None
 
 
 class MusicMetadata(BaseModel):

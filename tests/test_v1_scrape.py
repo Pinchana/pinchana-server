@@ -96,6 +96,7 @@ class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
                 author="creator",
                 author_name="Creator Name",
                 username="creator",
+                avatar_url="https://pbs.twimg.com/profile_images/avatar.jpg",
                 thumbnail_url="/media/twitter/tweet-1/one.jpg",
                 carousel=[
                     {
@@ -127,7 +128,11 @@ class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         data = response.data
-        self.assertEqual(data.author.model_dump(), {"name": "Creator Name", "username": "creator"})
+        self.assertEqual(data.author.model_dump(), {
+            "name": "Creator Name",
+            "username": "creator",
+            "avatar_url": "https://pbs.twimg.com/profile_images/avatar.jpg",
+        })
         self.assertEqual([item.type for item in data.media], ["image", "video"])
         self.assertEqual([item.index for item in data.media], [0, 1])
         self.assertFalse(data.media[0].looping)
