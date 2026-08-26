@@ -35,8 +35,8 @@ from pinchana_core.vpn import GluetunController, VpnRotationError
 
 from .media_probe import MediaDimensionProbe
 from .mobile_auth import MobileGrantError, MobileGrantStore, MobileInstallation
-from .response_adapter import normalize_scrape_response
-from .schemas import ApiErrorResponse, ScrapeV1Response
+from .response_adapter import normalize_inspect_response, normalize_scrape_response
+from .schemas import ApiErrorResponse, InspectV1Response, ScrapeV1Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -946,7 +946,12 @@ def _resolve_module(url: str):
     return None, None, None
 
 
-async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dict[str, Any]:
+async def _forward_to_container(
+    module_name: str,
+    request: ScrapeRequest,
+    *,
+    operation: str = "scrape",
+) -> dict[str, Any]:
     module = container_registry.modules.get(module_name)
     if not module:
         raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
@@ -960,7 +965,7 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dic
     )
     try:
         resp = await forward_client.post(
-            f"{endpoint}/scrape",
+            f"{endpoint}/{operation}",
             json={"url": str(request.url)},
         )
     except httpx.RequestError as exc:
@@ -973,8 +978,8 @@ async def _forward_to_container(module_name: str, request: ScrapeRequest) -> dic
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         logger.error(
-            "Upstream module %s (%s) returned %s for /scrape: %s",
-            module_name, endpoint, resp.status_code, resp.text,
+            "Upstream module %s (%s) returned %s for /%s: %s",
+            module_name, endpoint, resp.status_code, operation, resp.text,
         )
         raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
     payload = resp.json()
@@ -997,6 +1002,8 @@ def _rewrite_media_urls(value: Any, prefix: str) -> Any:
 async def _process_scrape_payload(
     request: ScrapeRequest,
     http_request: Request,
+    *,
+    operation: str = "scrape",
 ) -> tuple[str, dict[str, Any]]:
     """Route a scrape and retain the complete module payload for v1 adapters."""
     url = str(request.url)
@@ -1035,7 +1042,7 @@ async def _process_scrape_payload(
     if mode == "in_process":
         if internal_client is None:
             raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
-        resp = await internal_client.post(f"/{name}/scrape", json={"url": url})
+        resp = await internal_client.post(f"/{name}/{operation}", json={"url": url})
         if resp.status_code != 200:
             logger.error(
                 "scrape_upstream_error module=%s mode=%s status=%s body=%s",
@@ -1047,7 +1054,7 @@ async def _process_scrape_payload(
             logger.error("Upstream module %s returned a non-object scrape payload", name)
             raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
     else:
-        payload = await _forward_to_container(name, request)
+        payload = await _forward_to_container(name, request, operation=operation)
 
     logger.info(
         "scrape_complete module=%s mode=%s elapsed_ms=%.1f",
@@ -1197,6 +1204,40 @@ async def process_v1_scrape_request(
     """Return a versioned, normalized scrape response for machine clients."""
     logger.info("authenticated_v1_scrape client_name=%s", client_name)
     return await _normalized_scrape_response(request, http_request)
+
+
+@app.post(
+    "/v1/inspect",
+    response_model=InspectV1Response,
+    responses={
+        status: {"model": ApiErrorResponse}
+        for status in (400, 401, 403, 404, 422, 429, 500, 502, 503)
+    },
+)
+async def process_v1_inspect_request(
+    request: ScrapeRequest,
+    http_request: Request,
+    client_name: str = Depends(_require_api_key),
+):
+    """Inspect a social post and its one-level quote without downloading media."""
+    logger.info("authenticated_v1_inspect client_name=%s", client_name)
+    platform, payload = await _process_scrape_payload(
+        request,
+        http_request,
+        operation="inspect",
+    )
+    if platform not in {"twitter", "threads"}:
+        raise HTTPException(status_code=400, detail="Inspection is supported for X and Threads")
+    try:
+        return await normalize_inspect_response(
+            payload,
+            platform=platform,
+            source_url=str(request.url),
+            probe=dimension_probe,
+        )
+    except (ValueError, ValidationError) as exc:
+        logger.error("inspect_normalization_failed module=%s error=%s", platform, exc)
+        raise HTTPException(status_code=502, detail="The scraper returned an invalid response") from exc
 
 
 async def _normalized_scrape_response(

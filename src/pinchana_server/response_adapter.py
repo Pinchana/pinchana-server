@@ -9,6 +9,10 @@ from typing import Any
 from .media_probe import MediaDimensionProbe
 from .schemas import (
     EngagementMetadata,
+    EmbeddedPostData,
+    InspectedEmbeddedPostData,
+    InspectedPostData,
+    InspectV1Response,
     LinkMetadata,
     MediaAsset,
     MusicMetadata,
@@ -240,7 +244,37 @@ async def normalize_scrape_response(
     source_url: str,
     probe: MediaDimensionProbe,
 ) -> ScrapeV1Response:
-    descriptors = _media_descriptors(raw)
+    data = await _normalize_post_data(
+        raw,
+        platform=platform,
+        source_url=source_url,
+        probe=probe,
+        include_media=True,
+    )
+    quote_raw = raw.get("quote")
+    quote = None
+    if isinstance(quote_raw, dict):
+        quote_data = await _normalize_post_data(
+            quote_raw,
+            platform=platform,
+            source_url=_text(quote_raw.get("source_url")) or source_url,
+            probe=probe,
+            include_media=True,
+        )
+        quote = EmbeddedPostData.model_validate(quote_data.model_dump(exclude={"quote"}))
+    data.quote = quote
+    return ScrapeV1Response(data=data)
+
+
+async def _normalize_post_data(
+    raw: dict[str, Any],
+    *,
+    platform: Platform,
+    source_url: str,
+    probe: MediaDimensionProbe,
+    include_media: bool,
+) -> ScrapeData:
+    descriptors = _media_descriptors(raw) if include_media else []
     dimensions = await asyncio.gather(*(
         probe.dimensions_for(item["url"], item["type"])
         for item in descriptors
@@ -255,7 +289,7 @@ async def normalize_scrape_response(
         raise ValueError("Scraper response is missing its identifier")
     album = _text(raw.get("album"))
     link = _text(raw.get("link"))
-    return ScrapeV1Response(data=ScrapeData(
+    return ScrapeData(
         id=identifier,
         source=ScrapeSource(
             platform=platform,
@@ -274,4 +308,43 @@ async def normalize_scrape_response(
         engagement=_engagement(raw),
         safety=_safety(raw),
         link=LinkMetadata(url=link) if link else None,
+    )
+
+
+async def normalize_inspect_response(
+    raw: dict[str, Any],
+    *,
+    platform: Platform,
+    source_url: str,
+    probe: MediaDimensionProbe,
+) -> InspectV1Response:
+    data = await _normalize_post_data(
+        raw,
+        platform=platform,
+        source_url=source_url,
+        probe=probe,
+        include_media=False,
+    )
+    quote = None
+    quote_raw = raw.get("quote")
+    if isinstance(quote_raw, dict):
+        quote_data = await _normalize_post_data(
+            quote_raw,
+            platform=platform,
+            source_url=_text(quote_raw.get("source_url")) or source_url,
+            probe=probe,
+            include_media=False,
+        )
+        quote = InspectedEmbeddedPostData(
+            id=quote_data.id,
+            source=quote_data.source,
+            content=quote_data.content,
+            author=quote_data.author,
+        )
+    return InspectV1Response(data=InspectedPostData(
+        id=data.id,
+        source=data.source,
+        content=data.content,
+        author=data.author,
+        quote=quote,
     ))

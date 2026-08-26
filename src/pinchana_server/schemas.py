@@ -76,7 +76,7 @@ class LinkMetadata(BaseModel):
     url: str = Field(min_length=1)
 
 
-class ScrapeData(BaseModel):
+class EmbeddedPostData(BaseModel):
     id: str = Field(min_length=1)
     source: ScrapeSource
     content: ScrapeContent
@@ -88,12 +88,36 @@ class ScrapeData(BaseModel):
     link: LinkMetadata | None = None
 
 
+class ScrapeData(EmbeddedPostData):
+    quote: EmbeddedPostData | None = None
+
+
+class InspectedPostData(BaseModel):
+    id: str = Field(min_length=1)
+    source: ScrapeSource
+    content: ScrapeContent
+    author: ScrapeAuthor
+    quote: "InspectedEmbeddedPostData | None" = None
+
+
+class InspectedEmbeddedPostData(BaseModel):
+    id: str = Field(min_length=1)
+    source: ScrapeSource
+    content: ScrapeContent
+    author: ScrapeAuthor
+
+
 class ResponseMetadata(BaseModel):
     api_version: Literal["1"] = "1"
 
 
 class ScrapeV1Response(BaseModel):
     data: ScrapeData
+    meta: ResponseMetadata = Field(default_factory=ResponseMetadata)
+
+
+class InspectV1Response(BaseModel):
+    data: InspectedPostData
     meta: ResponseMetadata = Field(default_factory=ResponseMetadata)
 
 

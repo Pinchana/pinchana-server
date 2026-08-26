@@ -20,7 +20,10 @@ from pinchana_server.main import (
     app,
 )
 from pinchana_server.media_probe import MediaDimensionProbe
-from pinchana_server.response_adapter import normalize_scrape_response
+from pinchana_server.response_adapter import (
+    normalize_inspect_response,
+    normalize_scrape_response,
+)
 
 
 def _legacy_payload(**overrides):
@@ -44,6 +47,41 @@ def _legacy_payload(**overrides):
 
 
 class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quote_is_nested_in_scrape_but_inspection_skips_media(self):
+        probe = AsyncMock(spec=MediaDimensionProbe)
+        probe.dimensions_for.return_value = None
+        raw = _legacy_payload(
+            shortcode="main",
+            thumbnail_url="",
+            quote=_legacy_payload(
+                shortcode="quoted",
+                caption="Quoted text",
+                author="quoted",
+                username="quoted",
+                thumbnail_url="/media/twitter/main/quote_media_0.jpg",
+                source_url="https://x.com/quoted/status/quoted",
+            ),
+        )
+
+        scraped = await normalize_scrape_response(
+            raw,
+            platform="twitter",
+            source_url="https://x.com/main/status/main",
+            probe=probe,
+        )
+        inspected = await normalize_inspect_response(
+            raw,
+            platform="twitter",
+            source_url="https://x.com/main/status/main",
+            probe=probe,
+        )
+
+        self.assertEqual(scraped.data.quote.id, "quoted")
+        self.assertEqual(scraped.data.quote.media[0].role, "content")
+        self.assertEqual(str(scraped.data.quote.source.url), "https://x.com/quoted/status/quoted")
+        self.assertEqual(inspected.data.quote.content.text, "Quoted text")
+        self.assertEqual(inspected.data.quote.author.username, "quoted")
+
     async def test_mixed_carousel_has_dimensions_order_and_named_metadata(self):
         from pinchana_server.schemas import MediaDimensions
 
