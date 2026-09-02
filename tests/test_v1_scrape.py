@@ -16,6 +16,7 @@ from pinchana_server.main import (
     _http_error_code,
     _require_api_key,
     _require_web_session,
+    _retryable_error,
     api_http_exception_handler,
     app,
 )
@@ -461,6 +462,49 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
             ("restricted_media", "This Instagram post is not accessible anonymously"),
         )
         self.assertEqual(extraction, ("extraction_failed", "TikTok extraction failed"))
+
+    def test_retryable_error_contract_is_explicit(self):
+        self.assertTrue(_retryable_error(503, "media_download_failed"))
+        self.assertTrue(_retryable_error(502, "invalid_upstream_response"))
+        self.assertFalse(_retryable_error(404, "not_found"))
+        self.assertFalse(_retryable_error(422, "validation_error"))
+
+        anonymous = _http_error_code(
+            422,
+            {
+                "code": "anonymous_unavailable",
+                "message": "Instagram did not expose media anonymously",
+            },
+        )
+        self.assertEqual(
+            anonymous,
+            (
+                "anonymous_unavailable",
+                "Instagram did not expose media anonymously",
+            ),
+        )
+        self.assertFalse(_retryable_error(422, anonymous[0]))
+
+    async def test_v1_error_envelope_marks_retryable_and_disables_caching(self):
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []}
+        )
+        response = await api_http_exception_handler(
+            request,
+            HTTPException(
+                status_code=503,
+                detail={
+                    "code": "media_download_failed",
+                    "message": "Instagram media download failed",
+                },
+            ),
+        )
+        body = json.loads(response.body)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(body["error"]["code"], "media_download_failed")
+        self.assertTrue(body["error"]["retryable"])
 
     async def test_unsupported_url_error_does_not_expose_route_configuration(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []})
