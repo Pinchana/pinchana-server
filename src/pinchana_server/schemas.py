@@ -126,6 +126,7 @@ class ApiError(BaseModel):
     code: str
     message: str
     details: Any | None = None
+    retryable: bool = False
 
 
 class ApiErrorResponse(BaseModel):

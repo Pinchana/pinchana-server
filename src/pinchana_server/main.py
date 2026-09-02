@@ -846,10 +846,12 @@ def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
     upstream_code = _upstream_error_code(detail)
     if upstream_code in {
         "authentication_required",
+        "anonymous_unavailable",
         "restricted_media",
         "not_found",
         "rate_limited",
         "extraction_failed",
+        "media_download_failed",
     }:
         return upstream_code, raw_message
     lowered = raw_message.lower()
@@ -869,8 +871,24 @@ def _http_error_code(status_code: int, detail: Any) -> tuple[str, str]:
         500: ("internal_error", "The scraper failed to process this URL"),
         502: ("invalid_upstream_response", "The scraper returned an invalid response"),
         503: ("service_unavailable", raw_message),
+        504: ("gateway_timeout", raw_message),
     }
     return mapping.get(status_code, ("http_error", raw_message))
+
+
+def _retryable_error(status_code: int, code: str) -> bool:
+    """Return whether retrying after a scraper/API deployment can recover."""
+    if code in {
+        "rate_limited",
+        "service_unavailable",
+        "extraction_failed",
+        "media_download_failed",
+        "internal_error",
+        "invalid_upstream_response",
+        "gateway_timeout",
+    }:
+        return True
+    return status_code in {429, 500, 502, 503, 504}
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -880,8 +898,15 @@ async def api_http_exception_handler(request: Request, exc: StarletteHTTPExcepti
     code, message = _http_error_code(exc.status_code, exc.detail)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"code": code, "message": message, "details": None}},
-        headers=exc.headers,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "details": None,
+                "retryable": _retryable_error(exc.status_code, code),
+            }
+        },
+        headers={**(exc.headers or {}), "Cache-Control": "no-store"},
     )
 
 
@@ -896,8 +921,10 @@ async def api_validation_exception_handler(request: Request, exc: RequestValidat
                 "code": "validation_error",
                 "message": "Request validation failed",
                 "details": jsonable_encoder(exc.errors()),
+                "retryable": False,
             }
         },
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -914,8 +941,10 @@ async def api_unhandled_exception_handler(request: Request, exc: Exception):
                 "code": "internal_error",
                 "message": "An internal error occurred",
                 "details": None,
+                "retryable": True,
             }
         },
+        headers={"Cache-Control": "no-store"},
     )
 
 # Mount in-process plugin routers (if any)
