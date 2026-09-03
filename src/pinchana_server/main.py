@@ -1255,8 +1255,8 @@ async def process_v1_inspect_request(
         http_request,
         operation="inspect",
     )
-    if platform not in {"twitter", "threads"}:
-        raise HTTPException(status_code=400, detail="Inspection is supported for X and Threads")
+    if platform not in {"twitter", "threads", "coub"}:
+        raise HTTPException(status_code=400, detail="Inspection is supported for X, Threads, and Coub")
     try:
         return await normalize_inspect_response(
             payload,

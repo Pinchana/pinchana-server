@@ -48,6 +48,36 @@ def _legacy_payload(**overrides):
 
 
 class V1ResponseAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_coub_video_and_channel_metadata_are_normalized(self):
+        from pinchana_server.schemas import MediaDimensions
+
+        probe = AsyncMock(spec=MediaDimensionProbe)
+        probe.dimensions_for.return_value = MediaDimensions(width=1280, height=720)
+        response = await normalize_scrape_response(
+            _legacy_payload(
+                shortcode="abc123",
+                caption="A Coub title",
+                title="A Coub title",
+                author="Channel Name",
+                author_name="Channel Name",
+                username="channel-name",
+                media_type="video",
+                thumbnail_url="/media/coub/abc123/thumbnail.jpg",
+                video_url="/media/coub/abc123/video.mp4",
+                duration=59,
+                created_at="2026-09-01T10:00:00Z",
+            ),
+            platform="coub",
+            source_url="https://coub.com/view/abc123",
+            probe=probe,
+        )
+
+        self.assertEqual(response.data.source.platform, "coub")
+        self.assertEqual(response.data.author.name, "Channel Name")
+        self.assertEqual(response.data.author.username, "channel-name")
+        self.assertEqual(response.data.media[0].type, "video")
+        self.assertEqual(response.data.media[0].dimensions.model_dump(), {"width": 1280, "height": 720})
+
     async def test_quote_is_nested_in_scrape_but_inspection_skips_media(self):
         probe = AsyncMock(spec=MediaDimensionProbe)
         probe.dimensions_for.return_value = None
