@@ -15,6 +15,7 @@ Platform = Literal[
     "deezer",
     "threads",
     "twitter",
+    "coub",
 ]
 
 
