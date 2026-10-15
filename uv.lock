@@ -820,7 +820,7 @@ wheels = [
 
 [[package]]
 name = "pinchana-core"
-version = "26.10.1"
+version = "26.10.2"
 source = { directory = "../pinchana-core" }
 dependencies = [
     { name = "aiohttp" },
@@ -849,7 +849,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-server"
-version = "26.10.1"
+version = "26.10.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
