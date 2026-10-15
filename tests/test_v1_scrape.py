@@ -536,6 +536,30 @@ class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["error"]["code"], "media_download_failed")
         self.assertTrue(body["error"]["retryable"])
 
+    async def test_tiktok_short_url_outage_returns_json_service_unavailable(self):
+        with patch(
+            "pinchana_server.main._process_scrape_payload",
+            AsyncMock(side_effect=HTTPException(
+                status_code=503,
+                detail=json.dumps({"detail": {
+                    "code": "upstream_unavailable",
+                    "message": "TikTok is temporarily unavailable",
+                    "stage": "short_url",
+                }}),
+            )),
+        ):
+            response = await self._request(
+                "/v1/scrape",
+                payload={"url": "https://www.tt.site/t/ZGdC5uWuP"},
+                headers={"X-API-Key": "secret"},
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.json()["error"]["code"], "service_unavailable")
+        self.assertEqual(response.json()["error"]["message"], "TikTok is temporarily unavailable")
+        self.assertTrue(response.json()["error"]["retryable"])
+
     async def test_unsupported_url_error_does_not_expose_route_configuration(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []})
         response = await api_http_exception_handler(
