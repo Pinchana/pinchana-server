@@ -39,7 +39,7 @@ class GifConversionTests(unittest.TestCase):
                     output.write_bytes(b"GIF89a")
 
                 with (
-                    patch.object(storage, "base_path", cache),
+                    patch.object(storage, "_base_path", cache),
                     patch("pinchana_server.main._probe_media_duration", AsyncMock(return_value=3.5)),
                     patch("pinchana_server.main._convert_media_to_gif", side_effect=write_gif),
                 ):
@@ -69,7 +69,7 @@ class GifConversionTests(unittest.TestCase):
                 source = source_directory / "video.mp4"
                 with source.open("wb") as oversized:
                     oversized.truncate(GIF_MAX_INPUT_BYTES + 1)
-                with patch.object(storage, "base_path", cache):
+                with patch.object(storage, "_base_path", cache):
                     with self.assertRaises(HTTPException) as raised:
                         await web_convert_gif(
                             GifConversionRequest(platform="twitter", postId="post-1", filename="video.mp4"),
