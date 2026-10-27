@@ -314,6 +314,56 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> str:
     raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
+def _is_telegram_client(client_name: str) -> bool:
+    allowed = os.getenv("PINCHANA_TELEGRAM_CLIENTS", "bot").split(",")
+    return client_name in {name.strip() for name in allowed if name.strip()}
+
+
+def _transient_media_urls(value: Any, scope: str) -> Any:
+    """Address files written to an isolated, disposable scraper namespace."""
+    if isinstance(value, str) and value.startswith("/media/") and not any(c.isspace() for c in value):
+        parts = value.split("/", 4)
+        if len(parts) == 5 and parts[2] and parts[3] and parts[4]:
+            return f"/media/{parts[2]}/.transient/{scope}/{parts[3]}/{parts[4]}"
+    if isinstance(value, list):
+        return [_transient_media_urls(item, scope) for item in value]
+    if isinstance(value, dict):
+        return {key: _transient_media_urls(item, scope) for key, item in value.items()}
+    return value
+
+
+def _transient_root() -> Path:
+    return storage.base_path / ".transient"
+
+
+def _remove_transient_scope(scope: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{32}", scope):
+        raise HTTPException(status_code=400, detail="Invalid cache scope")
+    root = _transient_root().resolve()
+    target = (root / scope).resolve()
+    if target.parent != root:
+        raise HTTPException(status_code=400, detail="Invalid cache scope")
+    if target.is_dir():
+        shutil.rmtree(target)
+
+
+async def _transient_cleanup_loop() -> None:
+    """Remove orphaned uploads after failures or interrupted bot deliveries."""
+    while True:
+        root = _transient_root()
+        if root.is_dir():
+            deadline = time.time() - 6 * 3600
+            for folder in root.iterdir():
+                if folder.is_dir() and re.fullmatch(r"[0-9a-f]{32}", folder.name):
+                    try:
+                        newest = max((item.stat().st_mtime for item in folder.rglob("*") if item.is_file()), default=folder.stat().st_mtime)
+                        if newest < deadline:
+                            await asyncio.to_thread(_remove_transient_scope, folder.name)
+                    except OSError:
+                        logger.exception("Transient cache sweep failed for %s", folder.name)
+        await asyncio.sleep(900)
+
+
 def _urlsafe_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
@@ -794,9 +844,15 @@ async def lifespan(app: FastAPI):
         timeout=120.0,
     )
     await _initialize_mobile_auth()
+    transient_cleanup = asyncio.create_task(_transient_cleanup_loop())
     try:
         yield
     finally:
+        transient_cleanup.cancel()
+        try:
+            await transient_cleanup
+        except asyncio.CancelledError:
+            pass
         await forward_client.aclose()
         await internal_client.aclose()
         await storage.close()
@@ -980,6 +1036,7 @@ async def _forward_to_container(
     request: ScrapeRequest,
     *,
     operation: str = "scrape",
+    cache_scope: str | None = None,
 ) -> dict[str, Any]:
     module = container_registry.modules.get(module_name)
     if not module:
@@ -995,7 +1052,7 @@ async def _forward_to_container(
     try:
         resp = await forward_client.post(
             f"{endpoint}/{operation}",
-            json={"url": str(request.url)},
+            json={"url": str(request.url), **({"cache_scope": cache_scope} if cache_scope else {})},
         )
     except httpx.RequestError as exc:
         logger.error("Upstream module %s (%s) is unreachable: %s", module_name, endpoint, exc)
@@ -1033,6 +1090,7 @@ async def _process_scrape_payload(
     http_request: Request,
     *,
     operation: str = "scrape",
+    cache_scope: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Route a scrape and retain the complete module payload for v1 adapters."""
     url = str(request.url)
@@ -1071,7 +1129,10 @@ async def _process_scrape_payload(
     if mode == "in_process":
         if internal_client is None:
             raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
-        resp = await internal_client.post(f"/{name}/{operation}", json={"url": url})
+        resp = await internal_client.post(
+            f"/{name}/{operation}",
+            json={"url": url, **({"cache_scope": cache_scope} if cache_scope else {})},
+        )
         if resp.status_code != 200:
             logger.error(
                 "scrape_upstream_error module=%s mode=%s status=%s body=%s",
@@ -1083,7 +1144,12 @@ async def _process_scrape_payload(
             logger.error("Upstream module %s returned a non-object scrape payload", name)
             raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
     else:
-        payload = await _forward_to_container(name, request, operation=operation)
+        payload = await _forward_to_container(
+            name, request, operation=operation, cache_scope=cache_scope
+        )
+
+    if cache_scope and operation == "scrape":
+        payload = _transient_media_urls(payload, cache_scope)
 
     logger.info(
         "scrape_complete module=%s mode=%s elapsed_ms=%.1f",
@@ -1228,11 +1294,33 @@ async def process_scrape_request(
 async def process_v1_scrape_request(
     request: ScrapeRequest,
     http_request: Request,
+    response: Response,
     client_name: str = Depends(_require_api_key),
+    x_pinchana_delivery: str | None = Header(default=None),
 ):
     """Return a versioned, normalized scrape response for machine clients."""
     logger.info("authenticated_v1_scrape client_name=%s", client_name)
-    return await _normalized_scrape_response(request, http_request)
+    ephemeral = x_pinchana_delivery == "telegram" and _is_telegram_client(client_name)
+    scope = uuid.uuid4().hex if ephemeral else None
+    result = await _normalized_scrape_response(
+        request, http_request, cache_scope=scope
+    )
+    if scope:
+        response.headers["X-Pinchana-Cache-Scope"] = scope
+        response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@app.delete("/v1/bot/cache/{scope}", status_code=204)
+async def finish_telegram_cache_scope(
+    scope: str,
+    client_name: str = Depends(_require_api_key),
+):
+    """Delete only the disposable files belonging to this bot upload."""
+    if not _is_telegram_client(client_name):
+        raise HTTPException(status_code=403, detail="Not a Telegram client")
+    await asyncio.to_thread(_remove_transient_scope, scope)
+    return Response(status_code=204)
 
 
 @app.post(
@@ -1272,9 +1360,13 @@ async def process_v1_inspect_request(
 async def _normalized_scrape_response(
     request: ScrapeRequest,
     http_request: Request,
+    *,
+    cache_scope: str | None = None,
 ) -> ScrapeV1Response:
     """Run a scrape through the shared public v1 response adapter."""
-    platform, payload = await _process_scrape_payload(request, http_request)
+    platform, payload = await _process_scrape_payload(
+        request, http_request, cache_scope=cache_scope
+    )
     try:
         return await normalize_scrape_response(
             payload,
