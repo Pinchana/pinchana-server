@@ -276,7 +276,7 @@ def test_web_routes_reject_api_keys_and_foreign_sessions(tmp_path, monkeypatch):
         monkeypatch.setenv("TURNSTILE_SESSION_SECRET", "s" * 32)
         monkeypatch.setenv("PINCHANA_API_KEYS", '{"bot":"machine-key"}')
         monkeypatch.setattr(main, "playlist_jobs", manager)
-        monkeypatch.setattr(main.storage, "base_path", tmp_path)
+        monkeypatch.setattr(main.storage, "_base_path", tmp_path)
         monkeypatch.setattr(main, "_normalized_scrape_response", AsyncMock(return_value=media_result()))
         token, _ = main._issue_web_session()
         other, _ = main._issue_web_session()

@@ -208,7 +208,7 @@ def test_endpoint_authentication_and_client_allowlist(tmp_path, monkeypatch, key
                 "/v1/admin/cache/clear", json={"target": "ABC"},
                 headers={"X-API-Key": key} if key else {},
             )
-    with patch.object(main.storage, "base_path", tmp_path):
+    with patch.object(main.storage, "_base_path", tmp_path):
         response = asyncio.run(run())
     assert response.status_code == expected
     assert folder.exists() == (expected != 200)
