@@ -20,7 +20,8 @@ class AppleMusicGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(request.extensions["timeout"]["read"], 600)
             return httpx.Response(200, json={
                 "shortcode": "am-123", "caption": "Example", "title": "Example",
-                "author": "Artist", "media_type": "audio", "thumbnail_url": "",
+                "author": "Artist", "media_type": "audio", "thumbnail_url": "/media/apple_music/am-123/cover.jpg",
+                "cover_url": "/media/apple_music/am-123/cover.jpg",
                 "audio_url": "/media/apple_music/am-123/audio.mp3", "duration": 180,
             })
         async with httpx.AsyncClient(transport=httpx.MockTransport(forward)) as client:
@@ -31,9 +32,11 @@ class AppleMusicGatewayTests(unittest.IsolatedAsyncioTestCase):
                     Request({"type": "http", "method": "POST", "path": "/v1/scrape", "headers": []}),
                 )
         self.assertEqual(result.data.source.platform, "apple_music")
-        self.assertEqual(len(result.data.media), 1)
+        self.assertEqual(len(result.data.media), 2)
         self.assertEqual(result.data.media[0].type, "audio")
         self.assertEqual(result.data.media[0].artist, "Artist")
+        cover = next(item for item in result.data.media if item.role == "cover")
+        self.assertEqual(cover.type, "image")
 
     def test_shipped_registry_includes_apple_music(self):
         from pathlib import Path
