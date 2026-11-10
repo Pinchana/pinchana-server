@@ -35,7 +35,8 @@ class GifConversionTests(unittest.TestCase):
                 source_directory.mkdir()
                 (source_directory / "video.mp4").write_bytes(b"cached-video")
 
-                async def write_gif(_source: Path, output: Path) -> None:
+                async def write_gif(_source: Path, output: Path, *, duration: float) -> None:
+                    self.assertEqual(duration, 3.5)
                     output.write_bytes(b"GIF89a")
 
                 with (

@@ -33,8 +33,16 @@ from pinchana_core.storage import MediaStorage
 from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
+from .cache_admin import CacheClearRequest, CacheClearResponse, clear_media_cache, resolve_cache_target
 from .media_probe import MediaDimensionProbe
+from .gif_conversion import (
+    GIF_MAX_INPUT_BYTES,
+    GIF_MAX_OUTPUT_BYTES,
+    GIF_MAX_DURATION_SECONDS,
+    convert_media_to_gif,
+)
 from .mobile_auth import MobileGrantError, MobileGrantStore, MobileInstallation
+from .playlists import PlaylistJobs, PlaylistRequest, extract_collection, platform_for
 from .response_adapter import normalize_inspect_response, normalize_scrape_response
 from .schemas import ApiErrorResponse, InspectV1Response, ScrapeV1Response
 
@@ -64,15 +72,6 @@ BUILD_VERSION_PATTERN = re.compile(
     r"^\d{2}\.(?:0[1-9]|1[0-2])\.(?:[1-9]\d*)"
     r"(?:\+dev\.[0-9a-f]{7,40})?$",
     re.IGNORECASE,
-)
-GIF_MAX_INPUT_BYTES = 50 * 1024 * 1024
-GIF_MAX_OUTPUT_BYTES = 50 * 1024 * 1024
-GIF_MAX_DURATION_SECONDS = 60.0
-GIF_PROCESS_TIMEOUT_SECONDS = 45.0
-GIF_FILTER = (
-    "fps=12,scale='min(960,iw)':-2:flags=lanczos,split[frames][palette_source];"
-    "[palette_source]palettegen=max_colors=128:stats_mode=diff[palette];"
-    "[frames][palette]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
 )
 
 # ---------------------------------------------------------------------------
@@ -121,6 +120,7 @@ dimension_probe = MediaDimensionProbe(storage.base_path)
 
 forward_client: httpx.AsyncClient | None = None
 internal_client: httpx.AsyncClient | None = None
+playlist_jobs = PlaylistJobs()
 gif_conversion_slots = asyncio.Semaphore(2)
 gif_conversion_sessions: set[str] = set()
 gif_conversion_sessions_lock = asyncio.Lock()
@@ -853,6 +853,7 @@ async def lifespan(app: FastAPI):
             await transient_cleanup
         except asyncio.CancelledError:
             pass
+        await playlist_jobs.close()
         await forward_client.aclose()
         await internal_client.aclose()
         await storage.close()
@@ -1053,6 +1054,7 @@ async def _forward_to_container(
         resp = await forward_client.post(
             f"{endpoint}/{operation}",
             json={"url": str(request.url), **({"cache_scope": cache_scope} if cache_scope else {})},
+            **({"timeout": httpx.Timeout(600, connect=10)} if module_name == "apple_music" else {}),
         )
     except httpx.RequestError as exc:
         logger.error("Upstream module %s (%s) is unreachable: %s", module_name, endpoint, exc)
@@ -1197,9 +1199,11 @@ async def _run_media_process(*args: str, timeout: float) -> tuple[int, bytes, by
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except TimeoutError as exc:
-        process.kill()
-        await process.wait()
         raise HTTPException(status_code=504, detail="Media conversion timed out") from exc
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
     return process.returncode or 0, stdout[-4096:], stderr[-4096:]
 
 
@@ -1207,8 +1211,9 @@ async def _probe_media_duration(source: Path) -> float:
     return_code, stdout, stderr = await _run_media_process(
         "ffprobe",
         "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=duration:format=duration",
+        "-of", "json",
         str(source),
         timeout=5.0,
     )
@@ -1216,28 +1221,30 @@ async def _probe_media_duration(source: Path) -> float:
         logger.info("gif_conversion_rejected reason=probe_failed stderr_bytes=%d", len(stderr))
         raise HTTPException(status_code=422, detail="The media file cannot be converted")
     try:
-        duration = float(stdout.strip())
-    except (ValueError, OverflowError) as exc:
+        metadata = json.loads(stdout)
+        streams = metadata.get("streams")
+        if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+            raise ValueError("No video stream")
+        duration = None
+        for candidate in (streams[0].get("duration"), metadata.get("format", {}).get("duration")):
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if 0 < value < float("inf"):
+                duration = value
+                break
+        if duration is None:
+            raise ValueError("No finite duration")
+    except (TypeError, ValueError, AttributeError) as exc:
         raise HTTPException(status_code=422, detail="The media duration is unavailable") from exc
     if not 0 < duration <= GIF_MAX_DURATION_SECONDS:
         raise HTTPException(status_code=422, detail="GIF conversion supports media up to 60 seconds")
     return duration
 
 
-async def _convert_media_to_gif(source: Path, output: Path) -> None:
-    return_code, _stdout, stderr = await _run_media_process(
-        "ffmpeg",
-        "-nostdin", "-y", "-loglevel", "error",
-        "-i", str(source),
-        "-filter_complex", GIF_FILTER,
-        "-loop", "0",
-        "-fs", str(GIF_MAX_OUTPUT_BYTES),
-        str(output),
-        timeout=GIF_PROCESS_TIMEOUT_SECONDS,
-    )
-    if return_code != 0:
-        logger.info("gif_conversion_failed reason=ffmpeg_exit stderr_bytes=%d", len(stderr))
-        raise HTTPException(status_code=422, detail="The media file cannot be converted to GIF")
+async def _convert_media_to_gif(source: Path, output: Path, *, duration: float) -> None:
+    await convert_media_to_gif(source, output, duration=duration, run_process=_run_media_process)
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +1667,7 @@ async def web_capabilities(_claims: dict[str, Any] = Depends(_require_web_sessio
         "mediaConversions": {
             "gif": {"serverFallback": True},
         },
+        "playlists": {"available": True, "archive": "zip", "maxItems": 100},
     }
 
 
@@ -1701,11 +1709,11 @@ async def web_convert_gif(
         duration = await _probe_media_duration(source)
         temporary_directory = Path(tempfile.mkdtemp(prefix="pinchana-gif-"))
         output = temporary_directory / "output.gif"
-        await _convert_media_to_gif(source, output)
+        await _convert_media_to_gif(source, output, duration=duration)
         if not output.is_file() or output.stat().st_size <= 0:
             raise HTTPException(status_code=422, detail="GIF conversion produced an empty file")
         if output.stat().st_size > GIF_MAX_OUTPUT_BYTES:
-            raise HTTPException(status_code=413, detail="The converted GIF exceeds 50 MiB")
+            raise HTTPException(status_code=413, detail="The converted GIF exceeds 8 MiB")
 
         output_name = f"{source.stem}.gif"
         logger.info(
@@ -1731,6 +1739,84 @@ async def web_convert_gif(
         if temporary_directory is not None:
             shutil.rmtree(temporary_directory, ignore_errors=True)
         await _release_gif_conversion(owner)
+
+
+def _playlist_owner(claims: dict[str, Any]) -> str:
+    owner = claims.get("nonce")
+    if not isinstance(owner, str) or not owner:
+        raise HTTPException(401, "Invalid web session")
+    return owner
+
+
+async def _playlist_module_payload(platform: str, operation: str, url: str) -> dict[str, Any]:
+    if registry.get(platform) is None:
+        return await _forward_to_container(platform, ScrapeRequest(url=url), operation=operation)
+    if internal_client is None:
+        raise HTTPException(503, "Internal HTTP client is not ready")
+    response = await internal_client.post(f"/{platform}/{operation}", json={"url": url})
+    if not response.is_success:
+        raise HTTPException(response.status_code, "Could not prepare this playlist item")
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(502, "Invalid playlist module response")
+    return payload
+
+
+async def _resolve_playlist(url: str, directory: Path) -> tuple[str, list[str]]:
+    platform = platform_for(url)
+    if platform in {"spotify", "deezer"}:
+        # Native APIs and credentials stay inside their platform modules.
+        payload = await _playlist_module_payload(platform, "playlist", url)
+        urls = payload.get("urls")
+        if not isinstance(urls, list) or any(not isinstance(item, str) or platform_for(item) != platform for item in urls):
+            raise HTTPException(502, "Invalid playlist response")
+        return str(payload.get("title") or "Playlist"), urls
+    return await extract_collection(url, directory)
+
+
+async def _playlist_audio(source: Path, output: Path) -> None:
+    code, _, _ = await _run_media_process(
+        "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+        "-vn", "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", "128k",
+        "-fs", str(200 * 1024**2), str(output), timeout=120,
+    )
+    if code or not output.is_file() or output.stat().st_size >= 200 * 1024**2:
+        raise HTTPException(400, "Could not extract playlist audio")
+
+
+@app.post("/web/playlists/jobs", status_code=202)
+async def web_playlist_submit(
+    request: PlaylistRequest, http_request: Request,
+    claims: dict[str, Any] = Depends(_require_web_session),
+):
+    async def scrape(url: str) -> ScrapeV1Response:
+        if platform_for(url) == "youtube":
+            # Use the existing YouTube scraper, not the isolated DLP worker.
+            payload = await _playlist_module_payload("shorts", "playlist-item", url)
+            return await normalize_scrape_response(payload, platform="shorts", source_url=url, probe=dimension_probe)
+        return await _normalized_scrape_response(ScrapeRequest(url=url), http_request)
+
+    payload = playlist_jobs.submit(
+        _playlist_owner(claims), request, storage.base_path, _resolve_playlist, scrape, _playlist_audio,
+    )
+    return JSONResponse(payload, status_code=202, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/web/playlists/jobs/{job_id}")
+async def web_playlist_status(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_require_web_session)):
+    job = playlist_jobs.get(str(job_id), _playlist_owner(claims))
+    return JSONResponse(job.public(str(job_id)), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/web/playlists/jobs/{job_id}/file")
+async def web_playlist_file(job_id: uuid.UUID, claims: dict[str, Any] = Depends(_require_web_session)):
+    job = playlist_jobs.get(str(job_id), _playlist_owner(claims))
+    if job.status != "READY":
+        raise HTTPException(409, "Playlist archive is not ready")
+    return FileResponse(
+        job.directory / "playlist.zip", filename=job.filename, media_type="application/zip",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.post("/web/dlp/jobs")
@@ -1794,6 +1880,46 @@ async def web_dlp_file(
         headers=headers,
         background=BackgroundTask(upstream.aclose),
     )
+
+
+def _machine_dlp_owner(
+    client_name: str = Depends(_require_api_key),
+    user_id: str = Header(alias="X-Pinchana-User", pattern=r"^[1-9][0-9]{0,19}$"),
+) -> dict[str, str]:
+    # Separate API clients and their users from web/mobile session owners.
+    return {"nonce": "machine:" + json.dumps([client_name, user_id], separators=(",", ":"))}
+
+
+@app.get("/v1/dlp/capabilities")
+async def machine_dlp_capabilities(_claims: dict = Depends(_machine_dlp_owner)):
+    capabilities = await _dlp_capabilities()
+    return {"available": capabilities is not None, "capabilities": capabilities}
+
+
+@app.post("/v1/dlp/jobs")
+async def machine_dlp_allocate(claims: dict = Depends(_machine_dlp_owner)):
+    return await _dlp_json("POST", "/v2/jobs", claims)
+
+
+@app.post("/v1/dlp/jobs/{job_id}/submit")
+async def machine_dlp_submit(
+    job_id: uuid.UUID, request: DlpSubmitRequest,
+    claims: dict = Depends(_machine_dlp_owner),
+):
+    return await _dlp_json("POST", f"/v2/jobs/{job_id}/submit", claims,
+                           request.model_dump(mode="json", exclude_none=True))
+
+
+@app.get("/v1/dlp/jobs/{job_id}")
+async def machine_dlp_status(job_id: uuid.UUID, claims: dict = Depends(_machine_dlp_owner)):
+    return await _dlp_json("GET", f"/v2/jobs/{job_id}", claims)
+
+
+@app.get("/v1/dlp/jobs/{job_id}/file")
+async def machine_dlp_file(
+    job_id: uuid.UUID, request: Request, claims: dict = Depends(_machine_dlp_owner),
+):
+    return await web_dlp_file(job_id, request, claims)
 
 
 @app.post("/v1/mobile/dlp/jobs")
@@ -1907,8 +2033,35 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
-# Admin routes for VPN management
+# Admin routes
 # ---------------------------------------------------------------------------
+@app.post("/v1/admin/cache/clear", response_model=CacheClearResponse)
+async def admin_clear_cache(
+    request: CacheClearRequest,
+    client_name: str = Depends(_require_api_key),
+):
+    allowed = {
+        name.strip()
+        for name in os.getenv("PINCHANA_CACHE_ADMIN_CLIENTS", "bot,telegram-bot").split(",")
+        if name.strip()
+    }
+    if client_name not in allowed:
+        raise HTTPException(403, "This client cannot clear the media cache")
+    try:
+        shortcode = await resolve_cache_target(request.target, forward_client)
+        result = await asyncio.to_thread(clear_media_cache, storage.base_path, shortcode)
+    except TimeoutError as exc:
+        raise HTTPException(503, "Share link resolution timed out") from exc
+    except OSError as exc:
+        logger.exception("cache_clear_failed client=%s", client_name)
+        raise HTTPException(503, "Media cache could not be cleared") from exc
+    logger.info(
+        "cache_cleared client=%s shortcode=%s deleted_posts=%s freed_bytes=%s",
+        client_name, shortcode, result.deleted_posts, result.freed_bytes,
+    )
+    return result
+
+
 @app.post("/admin/vpn/rotate")
 async def admin_rotate_vpn(_client_name: str = Depends(_require_api_key)):
     """Manually trigger a VPN IP rotation via Gluetun."""

@@ -12,6 +12,7 @@ Platform = Literal[
     "soundcloud",
     "ytmusic",
     "spotify",
+    "apple_music",
     "deezer",
     "threads",
     "twitter",
