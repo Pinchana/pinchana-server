@@ -226,6 +226,7 @@ class DlpSubmitRequest(BaseModel):
     filenameStyle: Literal["classic", "basic", "pretty", "nerdy"] | None = None
     subtitleLanguage: str | None = Field(default=None, min_length=2, max_length=16)
     cookiesEnc: DlpCookiesEnvelope | None = None
+    useHostCookies: bool = True
 
     @field_validator("dubLanguage")
     @classmethod

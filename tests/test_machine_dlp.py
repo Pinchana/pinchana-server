@@ -30,6 +30,7 @@ def test_machine_jobs_preserve_authentication_ownership_and_stream_files():
                     "Content-Disposition": 'attachment; filename="video.mp4"', "Content-Type": "video/mp4"})
             if request.url.path.endswith("/submit"):
                 assert json.loads(request.content)["quality"] == "720p"
+                assert json.loads(request.content)["useHostCookies"] is False
                 return httpx.Response(200, json={"jobId": JOB, "status": "QUEUED"})
             return httpx.Response(200, json={"jobId": JOB, "status": "READY"})
         async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as forward:
@@ -39,7 +40,7 @@ def test_machine_jobs_preserve_authentication_ownership_and_stream_files():
                     allocated = await client.post("/v1/dlp/jobs", headers=headers)
                     assert allocated.status_code == 200
                     submitted = await client.post(f"/v1/dlp/jobs/{JOB}/submit", headers=headers,
-                                                  json={"url": "https://youtube.com/watch?v=abcdefghijk", "quality": "720p"})
+                                                  json={"url": "https://youtube.com/watch?v=abcdefghijk", "quality": "720p", "useHostCookies": False})
                     assert submitted.status_code == 200
                     assert (await client.get(f"/v1/dlp/jobs/{JOB}", headers=headers)).status_code == 200
                     response = await client.get(f"/v1/dlp/jobs/{JOB}/file", headers=headers)

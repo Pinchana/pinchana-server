@@ -226,3 +226,9 @@ Job ownership is isolated by authenticated client and user, independently of
 web/mobile sessions. The existing `DLP_ENABLED`, `DLP_URL`, `DLP_GATEWAY_TOKEN`,
 and `DLP_OWNER_SECRET` configuration applies. File responses are authenticated,
 streamed, and never stored in the public scrape cache.
+
+DLP job submissions accept `cookiesEnc` (the protocol-v2 worker-encrypted cookie
+envelope) and `useHostCookies` (default `true`). User cookies take priority over
+optional operator cookies configured on the DLP API. `useHostCookies: false`
+requests no host fallback. Only full YouTube video URLs may use these endpoints;
+Apple Music, Spotify, YouTube Music and Shorts retain their normal scraper paths.
