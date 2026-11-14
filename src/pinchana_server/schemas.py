@@ -15,6 +15,7 @@ Platform = Literal[
     "apple_music",
     "deezer",
     "threads",
+    "bluesky",
     "twitter",
     "coub",
 ]

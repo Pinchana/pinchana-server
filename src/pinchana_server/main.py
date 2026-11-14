@@ -1,4 +1,4 @@
-"""Pinchana Server — dynamically loads plugins or manages containers."""
+"""Pinchana gateway for the bundled scraper modules."""
 
 import asyncio
 import base64
@@ -14,7 +14,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,9 +28,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pinchana_core.models import ScrapeRequest, ScrapeResponse
-from pinchana_core.plugins import registry
 from pinchana_core.storage import MediaStorage
-from pinchana_core.docker_manager import ContainerRegistry, ModuleContainerManager
 from pinchana_core.vpn import GluetunController, VpnRotationError
 
 from .cache_admin import CacheClearRequest, CacheClearResponse, clear_media_cache, resolve_cache_target
@@ -42,6 +40,7 @@ from .gif_conversion import (
     convert_media_to_gif,
 )
 from .mobile_auth import MobileGrantError, MobileGrantStore, MobileInstallation
+from .modules import modules
 from .playlists import PlaylistJobs, PlaylistRequest, extract_collection, platform_for
 from .response_adapter import normalize_inspect_response, normalize_scrape_response
 from .schemas import ApiErrorResponse, InspectV1Response, ScrapeV1Response
@@ -74,39 +73,6 @@ BUILD_VERSION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ---------------------------------------------------------------------------
-# 1. In-process plugin discovery (optional — for local dev)
-# ---------------------------------------------------------------------------
-SCRAPER_MODULES = os.getenv("IN_PROCESS_PLUGINS", "").split(",")
-for mod_name in SCRAPER_MODULES:
-    mod_name = mod_name.strip()
-    if not mod_name:
-        continue
-    try:
-        import importlib
-        importlib.import_module(mod_name)
-        logger.info("Loaded in-process plugin: %s", mod_name)
-    except ImportError as e:
-        logger.debug("In-process plugin not available: %s (%s)", mod_name, e)
-
-# ---------------------------------------------------------------------------
-# 2. Container registry (always available — reads module endpoints from config)
-# ---------------------------------------------------------------------------
-container_registry = ContainerRegistry()
-
-# ---------------------------------------------------------------------------
-# 3. Container module manager (optional — for runtime build/start/stop)
-# ---------------------------------------------------------------------------
-container_manager: ModuleContainerManager | None = None
-if os.getenv("CONTAINER_MODE", "false").lower() in ("1", "true", "yes"):
-    try:
-        container_manager = ModuleContainerManager()
-        for name in list(container_manager.modules.keys()):
-            container_manager.start(name)
-        logger.info("Container manager initialized with %d modules", len(container_manager.modules))
-    except Exception as e:
-        logger.warning("Container manager failed to initialize: %s", e)
-
 gluetun = GluetunController()
 
 # ---------------------------------------------------------------------------
@@ -119,7 +85,6 @@ storage = MediaStorage(
 dimension_probe = MediaDimensionProbe(storage.base_path)
 
 forward_client: httpx.AsyncClient | None = None
-internal_client: httpx.AsyncClient | None = None
 playlist_jobs = PlaylistJobs()
 gif_conversion_slots = asyncio.Semaphore(2)
 gif_conversion_sessions: set[str] = set()
@@ -834,30 +799,29 @@ async def _initialize_mobile_auth() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global forward_client, internal_client
-    forward_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(120.0, connect=10.0),
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-    )
-    internal_client = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://pinchana.internal",
-        timeout=120.0,
-    )
-    await _initialize_mobile_auth()
-    transient_cleanup = asyncio.create_task(_transient_cleanup_loop())
-    try:
-        yield
-    finally:
-        transient_cleanup.cancel()
+    global forward_client
+    async with AsyncExitStack() as stack:
+        forward_client = await stack.enter_async_context(httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        ))
+        stack.callback(_reset_forward_client)
+        stack.push_async_callback(storage.close)
+        for module in modules.values():
+            await stack.enter_async_context(module.app.router.lifespan_context(module.app))
+        stack.push_async_callback(playlist_jobs.close)
+        await _initialize_mobile_auth()
+        transient_cleanup = asyncio.create_task(_transient_cleanup_loop())
         try:
-            await transient_cleanup
-        except asyncio.CancelledError:
-            pass
-        await playlist_jobs.close()
-        await forward_client.aclose()
-        await internal_client.aclose()
-        await storage.close()
+            yield
+        finally:
+            transient_cleanup.cancel()
+            await asyncio.gather(transient_cleanup, return_exceptions=True)
+
+
+def _reset_forward_client() -> None:
+    global forward_client
+    forward_client = None
 
 
 app = FastAPI(title="Pinchana Server", version=_public_build_version(), lifespan=lifespan)
@@ -1005,77 +969,9 @@ async def api_unhandled_exception_handler(request: Request, exc: Exception):
         headers={"Cache-Control": "no-store"},
     )
 
-# Mount in-process plugin routers (if any)
-for name, plugin in registry.items():
-    app.include_router(plugin.router, prefix=f"/{name}", tags=[name])
-    logger.info("Mounted in-process router: /%s", name)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _resolve_module(url: str):
-    """Find the best module (in-process or container) for a URL."""
-    url_lower = url.lower()
-
-    # 1. In-process plugin match
-    for name, plugin in registry.items():
-        for pattern in plugin.route_patterns:
-            if pattern.lower() in url_lower:
-                return "in_process", name, plugin
-
-    # 2. Container module match
-    for name, module in container_registry.modules.items():
-        for pattern in module.route_patterns:
-            if pattern.lower() in url_lower:
-                return "container", name, module
-
-    return None, None, None
-
-
-async def _forward_to_container(
-    module_name: str,
-    request: ScrapeRequest,
-    *,
-    operation: str = "scrape",
-    cache_scope: str | None = None,
-) -> dict[str, Any]:
-    module = container_registry.modules.get(module_name)
-    if not module:
-        raise HTTPException(status_code=404, detail=f"Container module {module_name} not configured")
-
-    endpoint = module.endpoint
-    if forward_client is None:
-        raise HTTPException(status_code=503, detail="Gateway HTTP client is not ready")
-    logger.info(
-        "scrape_forward module=%s endpoint=%s url=%s",
-        module_name, endpoint, request.url,
-    )
-    try:
-        resp = await forward_client.post(
-            f"{endpoint}/{operation}",
-            json={"url": str(request.url), **({"cache_scope": cache_scope} if cache_scope else {})},
-            **({"timeout": httpx.Timeout(600, connect=10)} if module_name == "apple_music" else {}),
-        )
-    except httpx.RequestError as exc:
-        logger.error("Upstream module %s (%s) is unreachable: %s", module_name, endpoint, exc)
-        raise HTTPException(
-            status_code=503,
-            detail=f"The {module_name} scraper is temporarily unavailable",
-        ) from exc
-    try:
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Upstream module %s (%s) returned %s for /%s: %s",
-            module_name, endpoint, resp.status_code, operation, resp.text,
-        )
-        raise HTTPException(status_code=resp.status_code, detail=resp.text) from e
-    payload = resp.json()
-    if not isinstance(payload, dict):
-        logger.error("Upstream module %s returned a non-object scrape payload", module_name)
-        raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
-    return payload
+    parsed = httpx.URL(url)
+    return next((module for module in modules.values() if module.matches(parsed)), None)
 
 
 def _rewrite_media_urls(value: Any, prefix: str) -> Any:
@@ -1101,62 +997,22 @@ async def _process_scrape_payload(
     client_address = f"{client.host}:{client.port}" if client else "unknown"
     logger.info("scrape_request client=%s url=%s", client_address, url)
 
-    mode, name, target = _resolve_module(url)
+    module = _resolve_module(url)
+    if module is None:
+        logger.warning("scrape_rejected reason=no_matching_module client=%s url=%s", client_address, url)
+        raise HTTPException(status_code=400, detail="No module handles this URL")
 
-    if mode is None:
-        plugin_patterns = {
-            plugin_name: plugin.route_patterns
-            for plugin_name, plugin in registry.items()
-        }
-        container_patterns = {
-            module_name: module.route_patterns
-            for module_name, module in container_registry.modules.items()
-        }
-        logger.warning(
-            "scrape_rejected reason=no_matching_module client=%s url=%s "
-            "plugin_patterns=%s container_patterns=%s",
-            client_address, url, plugin_patterns, container_patterns,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail="No module handles this URL. "
-                   f"Plugins: {plugin_patterns}  "
-                   f"Containers: {container_patterns}"
-        )
-
-    logger.info(
-        "scrape_route_selected client=%s url=%s module=%s mode=%s patterns=%s",
-        client_address, url, name, mode, target.route_patterns,
-    )
+    name = module.name
+    logger.info("scrape_route_selected client=%s url=%s module=%s", client_address, url, name)
     started = time.perf_counter()
-    if mode == "in_process":
-        if internal_client is None:
-            raise HTTPException(status_code=503, detail="Internal HTTP client is not ready")
-        resp = await internal_client.post(
-            f"/{name}/{operation}",
-            json={"url": url, **({"cache_scope": cache_scope} if cache_scope else {})},
-        )
-        if resp.status_code != 200:
-            logger.error(
-                "scrape_upstream_error module=%s mode=%s status=%s body=%s",
-                name, mode, resp.status_code, resp.text,
-            )
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        payload = resp.json()
-        if not isinstance(payload, dict):
-            logger.error("Upstream module %s returned a non-object scrape payload", name)
-            raise HTTPException(status_code=502, detail="The scraper returned an invalid response")
-    else:
-        payload = await _forward_to_container(
-            name, request, operation=operation, cache_scope=cache_scope
-        )
+    payload = await module.run(operation, request, cache_scope=cache_scope)
 
     if cache_scope and operation == "scrape":
         payload = _transient_media_urls(payload, cache_scope)
 
     logger.info(
-        "scrape_complete module=%s mode=%s elapsed_ms=%.1f",
-        name, mode, (time.perf_counter() - started) * 1000,
+        "scrape_complete module=%s elapsed_ms=%.1f",
+        name, (time.perf_counter() - started) * 1000,
     )
     return name, payload
 
@@ -1351,8 +1207,6 @@ async def process_v1_inspect_request(
         http_request,
         operation="inspect",
     )
-    if platform not in {"twitter", "threads", "coub"}:
-        raise HTTPException(status_code=400, detail="Inspection is supported for X, Threads, and Coub")
     try:
         return await normalize_inspect_response(
             payload,
@@ -1750,17 +1604,7 @@ def _playlist_owner(claims: dict[str, Any]) -> str:
 
 
 async def _playlist_module_payload(platform: str, operation: str, url: str) -> dict[str, Any]:
-    if registry.get(platform) is None:
-        return await _forward_to_container(platform, ScrapeRequest(url=url), operation=operation)
-    if internal_client is None:
-        raise HTTPException(503, "Internal HTTP client is not ready")
-    response = await internal_client.post(f"/{platform}/{operation}", json={"url": url})
-    if not response.is_success:
-        raise HTTPException(response.status_code, "Could not prepare this playlist item")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(502, "Invalid playlist module response")
-    return payload
+    return await modules[platform].run(operation, ScrapeRequest(url=url))
 
 
 async def _resolve_playlist(url: str, directory: Path) -> tuple[str, list[str]]:
@@ -2003,33 +1847,10 @@ async def serve_mobile_media(
 
 @app.get("/health")
 async def health_check():
-    results = {}
-    all_healthy = True
-
-    # In-process plugins
-    for name, plugin in registry.items():
-        try:
-            if internal_client is None:
-                raise RuntimeError("Internal HTTP client is not ready")
-            resp = await internal_client.get(f"/{name}/health")
-            resp.raise_for_status()
-            results[name] = {"mode": "in_process", "status": "healthy", "detail": resp.json()}
-        except Exception as e:
-            results[name] = {"mode": "in_process", "status": "unhealthy", "detail": str(e)}
-            all_healthy = False
-
-    # Container modules (HTTP health check via registry endpoint)
-    for name, module in container_registry.modules.items():
-        health = await container_registry.health(name)
-        if health["status"] == "healthy":
-            results[name] = {"mode": "container", "status": "healthy", "detail": health["detail"]}
-        else:
-            results[name] = {"mode": "container", "status": "unhealthy", "detail": health}
-            all_healthy = False
-
-    if not all_healthy:
+    checks = await asyncio.gather(*(module.health() for module in modules.values()))
+    results = dict(zip(modules, checks))
+    if any(check["status"] != "healthy" for check in checks):
         raise HTTPException(status_code=503, detail=results)
-
     return {"status": "healthy", "modules": results}
 
 
@@ -2104,51 +1925,11 @@ async def admin_revoke_mobile_installation(
 
 
 # ---------------------------------------------------------------------------
-# Admin routes for container management
+# Module inventory
 # ---------------------------------------------------------------------------
-@app.post("/admin/modules/{name}/start")
-async def admin_start_module(name: str, _client_name: str = Depends(_require_api_key)):
-    if not container_manager:
-        raise HTTPException(status_code=501, detail="Container mode is not enabled")
-    if name not in container_manager.modules:
-        raise HTTPException(status_code=404, detail=f"Module {name} not in config")
-    endpoint = container_manager.start(name)
-    return {"status": "started", "endpoint": endpoint}
-
-
-@app.post("/admin/modules/{name}/stop")
-async def admin_stop_module(name: str, _client_name: str = Depends(_require_api_key)):
-    if not container_manager:
-        raise HTTPException(status_code=501, detail="Container mode is not enabled")
-    container_manager.stop(name)
-    return {"status": "stopped"}
-
-
 @app.get("/admin/modules")
 async def admin_list_modules(_client_name: str = Depends(_require_api_key)):
-    result = {
-        "in_process": {name: {"patterns": p.route_patterns} for name, p in registry.items()},
+    return {
+        "in_process": {name: {"patterns": module.patterns} for name, module in modules.items()},
         "containers": {},
     }
-
-    # Show all configured container modules from registry
-    for name, m in container_registry.modules.items():
-        result["containers"][name] = {
-            "config": {
-                "source_type": m.source_type,
-                "source_url": m.source_url,
-                "port": m.port,
-                "endpoint": m.endpoint,
-                "image_tag": m.image_tag,
-                "route_patterns": m.route_patterns,
-            },
-            "running": False,
-        }
-
-    # If container manager is active, overlay running status
-    if container_manager:
-        for name in container_manager.running:
-            if name in result["containers"]:
-                result["containers"][name]["running"] = True
-
-    return result

@@ -1,11 +1,23 @@
 [project]
 name = "pinchana-server"
 version = "26.11.6"
-description = "Unified scraper server with runtime plugin discovery"
+description = "Pinchana gateway with build-time scraper modules"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "pinchana-core",
+    "pinchana-apple-music",
+    "pinchana-bluesky",
+    "pinchana-coub",
+    "pinchana-deezer",
+    "pinchana-inst",
+    "pinchana-shorts",
+    "pinchana-soundcloud",
+    "pinchana-spotify",
+    "pinchana-threads",
+    "pinchana-tiktok",
+    "pinchana-twitter",
+    "pinchana-ytmusic",
     "fastapi>=0.162.2",
     "httpx>=0.28.1",
     "pydantic>=2.14.3",
@@ -19,6 +31,18 @@ dev = [
 
 [tool.uv.sources]
 pinchana-core = { path = "../pinchana-core" }
+pinchana-apple-music = { path = "../pinchana-apple-music" }
+pinchana-bluesky = { path = "../pinchana-bluesky" }
+pinchana-coub = { path = "../pinchana-coub" }
+pinchana-deezer = { path = "../pinchana-deezer" }
+pinchana-inst = { path = "../pinchana-inst" }
+pinchana-shorts = { path = "../pinchana-shorts" }
+pinchana-soundcloud = { path = "../pinchana-soundcloud" }
+pinchana-spotify = { path = "../pinchana-spotify" }
+pinchana-threads = { path = "../pinchana-threads" }
+pinchana-tiktok = { path = "../pinchana-tiktok" }
+pinchana-twitter = { path = "../pinchana-twitter" }
+pinchana-ytmusic = { path = "../pinchana-ytmusic" }
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

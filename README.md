@@ -1,25 +1,23 @@
 # Pinchana Server
 
-Pinchana Server is the central HTTP gateway for Pinchana. It authenticates clients, selects a platform module from configured URL patterns, normalizes API v1 responses, serves protected cached media, and exposes the isolated browser-session flow.
+Pinchana Server is the central HTTP gateway for Pinchana. It authenticates clients, selects a bundled platform module from its registered URL patterns, normalizes API v1 responses, serves protected cached media, and exposes the isolated browser-session flow.
 
 ---
 
 ## Responsibilities
 
 - Exposes normalized `/v1/scrape` and legacy `/scrape` routes for supported platforms.
-- Selects the appropriate module by matching patterns in `modules.yaml`.
-- Proxies requests to containerized modules or calls registered in-process plugins.
+- Calls bundled scraper handlers in-process and manages their lifecycles.
 - Provides authenticated administration routes for Gluetun status and rotation.
 - Serves files from the shared media cache with authentication and range support.
-- Optionally manages module containers when `CONTAINER_MODE=true` and the Docker socket is mounted.
 
 ---
 
 ## Request flow
 
 1. A machine client sends `POST /v1/scrape` with a complete HTTP(S) URL and `X-API-Key`.
-2. The server validates the request and selects the first matching module from `modules.yaml`.
-3. It calls an in-process plugin or forwards the request to the configured module endpoint.
+2. The server validates the request and selects a scraper by hostname and path.
+3. It calls the scraper handler directly.
 4. It converts the module result to the stable v1 `{data, meta}` envelope.
 5. The client retrieves protected `/media/...` paths with the same machine key.
 
@@ -181,7 +179,7 @@ requests may repopulate an entry after it is cleared.
 Triggers an immediate VPN IP rotation.
 
 ### `GET /admin/modules`
-Returns a list of all configured modules and their status.
+Returns the bundled modules and their URL patterns. `GET /health` reports module health.
 
 ---
 
@@ -189,8 +187,6 @@ Returns a list of all configured modules and their status.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CONTAINER_MODE` | `false` | Enable Docker container management features. |
-| `MODULES_CONFIG` | `/app/config/modules.yaml` | Path to the module routing configuration. |
 | `CACHE_PATH` | `./cache` | Base path for serving cached media. |
 | `PINCHANA_CACHE_ADMIN_CLIENTS` | `bot,telegram-bot` | Named machine clients allowed to clear completed media posts; empty disables clearing. |
 | `PINCHANA_INSTANCE_CERTIFICATE` | unset | Project-issued JSON certificate envelope for this public origin. |

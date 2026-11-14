@@ -43,6 +43,7 @@ HOSTS = {
     "instagram.com": "instagram", "www.instagram.com": "instagram", "instagr.am": "instagram",
     "threads.net": "threads", "www.threads.net": "threads", "threads.com": "threads",
     "www.threads.com": "threads", "x.com": "twitter", "www.x.com": "twitter",
+    "bsky.app": "bluesky",
     "twitter.com": "twitter", "www.twitter.com": "twitter",
     "vxtwitter.com": "twitter", "fxtwitter.com": "twitter", "coub.com": "coub",
     "www.coub.com": "coub", "m.tiktok.com": "tiktok",
