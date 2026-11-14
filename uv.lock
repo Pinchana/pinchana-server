@@ -1065,7 +1065,7 @@ wheels = [
 
 [[package]]
 name = "pinchana-apple-music"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-apple-music" }
 dependencies = [
     { name = "fastapi" },
@@ -1084,7 +1084,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-bluesky"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-bluesky" }
 dependencies = [
     { name = "fastapi" },
@@ -1103,7 +1103,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-core"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-core" }
 dependencies = [
     { name = "aiohttp" },
@@ -1132,7 +1132,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-coub"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-coub" }
 dependencies = [
     { name = "fastapi" },
@@ -1159,7 +1159,7 @@ dev = [
 
 [[package]]
 name = "pinchana-deezer"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-deezer" }
 dependencies = [
     { name = "deezer-python" },
@@ -1180,7 +1180,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-inst"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-inst" }
 dependencies = [
     { name = "curl-cffi" },
@@ -1211,7 +1211,7 @@ dev = [
 
 [[package]]
 name = "pinchana-server"
-version = "26.11.6"
+version = "26.11.7"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -1264,7 +1264,7 @@ dev = [{ name = "pytest", specifier = ">=9.2.0" }]
 
 [[package]]
 name = "pinchana-shorts"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-shorts" }
 dependencies = [
     { name = "fastapi" },
@@ -1289,7 +1289,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-soundcloud"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-soundcloud" }
 dependencies = [
     { name = "fastapi" },
@@ -1306,7 +1306,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-spotify"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-spotify" }
 dependencies = [
     { name = "fastapi" },
@@ -1327,7 +1327,7 @@ requires-dist = [
 
 [[package]]
 name = "pinchana-threads"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-threads" }
 dependencies = [
     { name = "cloakbrowser" },
@@ -1362,7 +1362,7 @@ dev = [
 
 [[package]]
 name = "pinchana-tiktok"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-tiktok" }
 dependencies = [
     { name = "curl-cffi" },
@@ -1393,7 +1393,7 @@ dev = [
 
 [[package]]
 name = "pinchana-twitter"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-twitter" }
 dependencies = [
     { name = "curl-cffi" },
@@ -1422,7 +1422,7 @@ dev = [
 
 [[package]]
 name = "pinchana-ytmusic"
-version = "26.11.6"
+version = "26.11.7"
 source = { directory = "../pinchana-ytmusic" }
 dependencies = [
     { name = "fastapi" },

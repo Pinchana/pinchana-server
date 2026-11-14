@@ -1,6 +1,6 @@
 [project]
 name = "pinchana-server"
-version = "26.11.6"
+version = "26.11.7"
 description = "Pinchana gateway with build-time scraper modules"
 readme = "README.md"
 requires-python = ">=3.13"
